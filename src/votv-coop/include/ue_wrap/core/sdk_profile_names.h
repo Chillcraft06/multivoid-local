@@ -635,6 +635,9 @@ inline constexpr const wchar_t* DaynightCycle_setRainParticlesFn   = L"setRainPa
 // mainGamemode.redSky @0x0888 (mainGamemode.hpp:150) when one lives and spawns one there otherwise
 // (ue_wrap/world/red_sky).
 inline constexpr const wchar_t* MainGamemode_SpawnRedSkyFn      = L"spawnRedSky";
+// AmainGamemode_C::spawnBlackFog(): the black fog event birth (weather_fog's client lane
+// mirror-spawns through it with the echo raised).
+inline constexpr const wchar_t* MainGamemode_SpawnBlackFogFn   = L"spawnBlackFog";
 // The two weather-event birth classes (weather_event_births' client birth catch).
 inline constexpr const wchar_t* WeatherFogControllerClass      = L"weatherFogController_C";
 inline constexpr const wchar_t* BlackFogClass                  = L"blackFog_C";

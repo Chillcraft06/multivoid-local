@@ -61,10 +61,10 @@ void OnFinishSpawnPost(void* /*context*/, void* /*srcObj*/, void* result) {
     if (match < 0) return;
     auto* s = g_session.load(std::memory_order_acquire);
     if (!s || !s->connected()) return;
-    // A wire-commanded mirror birth passes: the fog lane raises its echo flag
-    // around its own reflected spawn Call. (blackFog_C has no apply lane yet --
-    // every client birth of it is organic by construction.)
-    if (coop::weather_fog::MirrorEchoActive()) return;
+    // A wire-commanded mirror birth passes: the fog lane raises its echo flag around its own
+    // reflected spawn Call (spawnFog's echo for the fog controller, the black-fog echo for
+    // blackFog_C).
+    if (coop::weather_fog::MirrorEchoActive() || coop::weather_fog::BlackFogEchoActive()) return;
     if (!R::IsLive(actor)) return;
     E::DestroyActor(actor);
     const uint32_t nSup = ++g_suppressed[match];

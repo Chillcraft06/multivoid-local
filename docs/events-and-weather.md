@@ -54,8 +54,10 @@ client the same five scheduler bodies are cancelled before they run, so the clie
 writes, because the snow function alone has dozens of Blueprint listeners (`coop/world/weather_rain`).
 
 Fog is not a flag: the enable flags are config gates, and the active fog is an actor (the rolling
-fog controller, the super fog) that ramps the height-fog density over its own duration and
-destroys itself; the host mirrors the actor's life (`coop/world/weather_fog`). A lightning
+fog controller, the super fog, the black fog) that ramps the height-fog density over its own duration and
+destroys itself; the host mirrors the actor's life (`coop/world/weather_fog`). The black fog's
+presence rides `flags2` as `kBlackFogActive`, and the client mirror-spawns it through the
+gamemode's own `spawnBlackFog` with the echo raised past the birth-catch. A lightning
 strike is a transient actor; the host observes its spawn and sends the location
 (`coop/world/weather_lightning`). The red sky is a story event actor that the clock's hour pulse
 toggles at noon on every peer -- a living one ends, else a one-percent roll starts one --
@@ -196,7 +198,6 @@ edge. A one-shot cue a joiner was not present for is missed, by definition.
 
 | Limit | Evidence |
 |---|---|
-| A black fog the host rolls has no wire lane yet; the client's own rolls are suppressed | `[V]` `coop/world/weather_event_births` |
 | The flesh rain is rolled by every peer's own hour pulse and is not mirrored (the sky eye and the jellyfish are not: `SkyState` carries the eye, the world-actor lane the host's fish, and a client's own `setEye` and path spawn are refused) | `[RD]` the clock's hour roll; the jellyfish is on the world-actor mirror's list, but its spawn happens inside a Blueprint where the mirror's catch does not see it |
 | A decorated Christmas tree spawns its gifts on each peer whose player sleeps through midnight, and a client's gifts are its own | `[RD]` the tree's own check of the local player's sleep at hour 0 |
 | Several rolls are still per peer: the rare gamemode rolls (the one-percent forced quit), the server break-minigame variant, the underground loot mounds, the signal scramble and the radio-tower shuffle | `[V]` no lane under `coop/world` carries them; `coop/interactables/garbage_sync` names the mounds |

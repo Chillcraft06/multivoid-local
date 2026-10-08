@@ -25,11 +25,18 @@ namespace E  = ue_wrap::engine;
 // Resolved once. spawnFog spawns the fog controller into the cycle's fog slot and drives the
 // height-fog density; SetFogDensity pushes the final density into the cycle's height-fog
 // component, used by the late-joiner snap so a written density takes effect on the apply
-// frame.
+// frame. spawnBlackFog is the gamemode's black-fog birth verb, mirror-called on the client.
 void* g_spawnFogFn      = nullptr;
 void* g_setFogDensityFn = nullptr;  // the cycle's SetFogDensity (pushes the final density into the height fog)
+void* g_spawnBlackFogFn = nullptr;  // AmainGamemode_C::spawnBlackFog
 bool  g_installed  = false;
 bool  g_clientInterceptorReg = false;
+
+// The black-fog echo for the client birth-catch: ApplyFromHost raises it around its own
+// spawnBlackFog call so the wire-commanded birth passes weather_event_births' catch, which
+// otherwise destroys every organic client birth of blackFog_C. Separate from the spawnFog
+// echo: different verb, different birth class.
+std::atomic<bool> g_blackFogEcho{false};
 
 // The client echo-suppress for spawnFog: while false, the client's spawnFog interceptor
 // cancels the blueprint body (the client never independently makes fog); ApplyFromHost sets
@@ -55,6 +62,7 @@ long long g_lastDetectMs    = 0;
 // broadcasts. Cheap: a slot pointer read, no object-array walk.
 bool      g_haveHostFog        = false;  // received >=1 host fog state
 bool      g_lastHostFogActive  = false;  // host's last-known rolling-fog presence (kFogActive)
+bool      g_lastHostBlackFogActive = false;  // host's last-known black-fog presence (kBlackFogActive)
 long long g_lastReconcileMs    = 0;
 
 // The super-fog presence cache. The 3 Hz fog-edge detector once counted objects by class, a
@@ -66,6 +74,13 @@ long long g_lastReconcileMs    = 0;
 void*     g_superFogActor   = nullptr;
 int32_t   g_superFogIdx     = -1;
 long long g_lastSuperScanMs = 0;
+
+// The black-fog presence cache: the same shape as the super-fog one. Black fog is a rare,
+// minutes-long event actor found by class (no cycle slot holds it), so the same coarse
+// 5 s rescan applies; the actor-index revalidate catches the despawn edge every detection.
+void*     g_blackFogActor   = nullptr;
+int32_t   g_blackFogIdx     = -1;
+long long g_lastBlackFogScanMs = 0;
 
 long long NowMs() {
     using namespace std::chrono;
@@ -86,6 +101,20 @@ bool HostHasSuperFog() {
     return false;
 }
 
+// True iff a live black-fog actor exists. Same discipline as HostHasSuperFog: constant time
+// on the cached index revalidate, a single by-class find at most once per 5 s otherwise.
+bool HostHasBlackFog() {
+    if (g_blackFogActor && R::IsLiveByIndex(g_blackFogActor, g_blackFogIdx)) return true;
+    g_blackFogActor = nullptr;
+    g_blackFogIdx   = -1;
+    const long long now = NowMs();
+    if (now - g_lastBlackFogScanMs < 5000) return false;
+    g_lastBlackFogScanMs = now;
+    void* bf = R::FindObjectByClass(P::name::BlackFogClass);
+    if (bf && R::IsLive(bf)) { g_blackFogActor = bf; g_blackFogIdx = R::InternalIndexOf(bf); return true; }
+    return false;
+}
+
 // Compute the host's active-fog bits from the live cycle. All reads are cheap: the fog slot
 // is a pointer read, super fog goes through the cache, the permanent flag is a bool read.
 uint8_t ComputeHostFogBits(void* cycle) {
@@ -96,9 +125,22 @@ uint8_t ComputeHostFogBits(void* cycle) {
         f2 |= kFogActive;
     if (HostHasSuperFog())
         f2 |= kSuperFogActive;
+    if (HostHasBlackFog())
+        f2 |= kBlackFogActive;
     if (*reinterpret_cast<bool*>(b + P::off::AdaynightCycle_permanentFog))
         f2 |= kPermanentFog;
     return f2;
+}
+
+// The live (non-CDO) mainGamemode instance: the event_trigger ambient-verb pattern -- first
+// live object of the class that is not a Default__. The black-fog mirror spawn calls the
+// gamemode's own verb on it, maximally native.
+void* FindLiveGamemode() {
+    for (void* obj : R::FindObjectsByClass(P::name::GamemodeClass)) {
+        if (obj && R::IsLive(obj) && !R::NameStartsWith(R::NameOf(obj), L"Default__"))
+            return obj;
+    }
+    return nullptr;
 }
 
 // The spawnFog interceptor; true cancels the blueprint body. Cancels organic spawnFog only on
@@ -125,6 +167,13 @@ bool Install(bool isHost) {
     // SetFogDensity for the late-joiner density snap; best effort, since an unresolved verb only
     // delays the snapped density to the cycle's next tick.
     if (!g_setFogDensityFn) g_setFogDensityFn = R::FindFunction(cls, P::name::DaynightCycle_setFogDensityFn);
+    // The black-fog mirror verb off the gamemode class; required like spawnFog, retried the
+    // same way -- a client that cannot mirror-spawn must not latch installed.
+    if (!g_spawnBlackFogFn) {
+        if (void* gmCls = R::FindClass(P::name::GamemodeClass))
+            g_spawnBlackFogFn = R::FindFunction(gmCls, P::name::MainGamemode_SpawnBlackFogFn);
+    }
+    if (!g_spawnBlackFogFn) return false;
 
     // Register the spawnFog interceptor once, for both roles (it self-gates on the role, a
     // pass-through on the host). Do not latch installed until it succeeds: a silently dropped
@@ -232,6 +281,33 @@ void ApplyFromHost(void* cycle, const coop::net::WeatherStatePayload& payload) {
         }
     }
 
+    // Black fog: presence mirror through the gamemode's own verb (a pulse, no diff-skip).
+    // Host fog + client none -> echo-raised spawnBlackFog on the live gamemode, so the
+    // birth-catch passes the commanded birth; host clear + client live -> destroy the stray.
+    // The actor owns its duration and self-destructs; there is no ramp state to snap, and no
+    // cycle slot to null -- presence is by class, like the super fog.
+    const bool hostBlackFogActive = (payload.flags2 & kBlackFogActive) != 0;
+    g_lastHostBlackFogActive = hostBlackFogActive;
+    {
+        void* bf = R::FindObjectByClass(P::name::BlackFogClass);
+        const bool clientHasBlackFog = bf && R::IsLive(bf);
+        if (!hostBlackFogActive && clientHasBlackFog) {
+            E::DestroyActor(bf);
+            UE_LOGI("weather_fog: host CLEAR -> destroyed client black-fog actor");
+        } else if (hostBlackFogActive && !clientHasBlackFog && g_spawnBlackFogFn) {
+            if (void* gm = FindLiveGamemode()) {
+                g_blackFogEcho.store(true, std::memory_order_release);
+                ue_wrap::ParamFrame f(g_spawnBlackFogFn);
+                ue_wrap::Call(gm, f);
+                g_blackFogEcho.store(false, std::memory_order_release);
+                UE_LOGI("weather_fog: host BLACKFOG -> mirror-spawned client black-fog actor");
+            } else {
+                UE_LOGW("weather_fog: host BLACKFOG but no live gamemode -- mirror spawn "
+                        "deferred to the next apply");
+            }
+        }
+    }
+
     // The base ambient height-fog density: snap to the host's value unconditionally (also when
     // the host is clear), then push it into the height-fog component. The cycle's clear-weather
     // floor is small but non-zero, and a freshly joined client reads zero until its own tick
@@ -251,31 +327,48 @@ void ApplyFromHost(void* cycle, const coop::net::WeatherStatePayload& payload) {
 }
 
 void TickClientReconcile(void* cycle) {
-    // The client-only backstop: continuously enforce host-clear, so a rolling-fog actor that
-    // leaked the pre-suppression connect window (which a clear and static host never
-    // re-broadcasts to clear) does not persist as fog lingering around the client. Runs only as
-    // the client, only after at least one host fog state, and only when that state was clear,
-    // since with host fog the legitimate mirror actor must survive. Cheap: a slot pointer read;
-    // throttled to 3 s, since fog is slow.
+    // The client-only backstop: continuously enforce host-clear, so a fog actor that leaked
+    // the pre-suppression connect window (which a clear and static host never re-broadcasts
+    // to clear) does not persist. Runs only as the client and only after at least one host
+    // fog state. Cheap: slot pointer reads and one by-class find; throttled to 3 s, since
+    // fog is slow.
     if (!GT::IsGameThread()) return;
     if (!g_isClient.load(std::memory_order_acquire)) return;
-    if (!g_haveHostFog || g_lastHostFogActive) return;  // act only when host known-CLEAR
+    if (!g_haveHostFog) return;
     if (!cycle || !R::IsLive(cycle)) return;
     const long long now = NowMs();
     if (now - g_lastReconcileMs < 3000) return;
     g_lastReconcileMs = now;
 
     auto* b = reinterpret_cast<uint8_t*>(cycle);
-    void** slot = reinterpret_cast<void**>(b + P::off::AdaynightCycle_fogEventObject);
-    if (*slot && R::IsLive(*slot)) {
-        E::DestroyActor(*slot);
-        *slot = nullptr;
-        UE_LOGI("weather_fog: client reconcile -> destroyed stray rolling-fog actor (host is clear)");
+    // Rolling fog: act only when the host's rolling fog is known-CLEAR -- with host fog the
+    // legitimate mirror actor must survive.
+    if (!g_lastHostFogActive) {
+        void** slot = reinterpret_cast<void**>(b + P::off::AdaynightCycle_fogEventObject);
+        if (*slot && R::IsLive(*slot)) {
+            E::DestroyActor(*slot);
+            *slot = nullptr;
+            UE_LOGI("weather_fog: client reconcile -> destroyed stray rolling-fog actor (host is clear)");
+        }
+    }
+    // Black fog: independent of the rolling fog -- the host can hold one while clear of the
+    // other, so it reads its own last-known bit.
+    if (!g_lastHostBlackFogActive) {
+        if (void* bf = R::FindObjectByClass(P::name::BlackFogClass)) {
+            if (R::IsLive(bf)) {
+                E::DestroyActor(bf);
+                UE_LOGI("weather_fog: client reconcile -> destroyed stray black-fog actor (host is clear)");
+            }
+        }
     }
 }
 
 bool MirrorEchoActive() {
     return g_spawnFogEchoSuppress.load(std::memory_order_acquire);
+}
+
+bool BlackFogEchoActive() {
+    return g_blackFogEcho.load(std::memory_order_acquire);
 }
 
 bool HostFogStateChanged(void* cycle) {
@@ -293,13 +386,18 @@ bool HostFogStateChanged(void* cycle) {
 
 void OnDisconnect() {
     g_spawnFogEchoSuppress.store(false, std::memory_order_release);
+    g_blackFogEcho.store(false, std::memory_order_release);
     g_lastHostFogBits = 0xFF;
     g_lastDetectMs    = 0;
     g_superFogActor   = nullptr;  // session-scoped; a reconnect re-scans
     g_superFogIdx     = -1;
     g_lastSuperScanMs = 0;
+    g_blackFogActor   = nullptr;  // session-scoped; a reconnect re-scans
+    g_blackFogIdx     = -1;
+    g_lastBlackFogScanMs = 0;
     g_haveHostFog       = false;  // the next session re-learns the host's fog state
     g_lastHostFogActive = false;
+    g_lastHostBlackFogActive = false;
     g_lastReconcileMs   = 0;
     // The installed and registered flags stay set across sessions: the spawnFog function is
     // stable (the same class) and the interceptor self-gates at runtime on the role, which
