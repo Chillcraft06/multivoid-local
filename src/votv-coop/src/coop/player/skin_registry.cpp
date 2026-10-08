@@ -95,12 +95,6 @@ constexpr KelVariant kKelVariants[] = {
     { "kel_frost",   0.86f, 0.87f, 0.91f },  // silver white
 };
 
-const KelVariant* KelVariantTint(const std::string& name) {
-    for (const auto& v : kKelVariants)
-        if (name == v.name) return &v;
-    return nullptr;
-}
-
 bool DirProvidesSkin(const std::wstring& dirW, const char* skin) {
     std::error_code ec;
     fs::path own = fs::path(dirW) / skin;
@@ -118,6 +112,16 @@ bool DirProvidesSkin(const std::wstring& dirW, const char* skin) {
 }
 
 }  // namespace
+
+// Defines the coop::skins::KelVariantTint declared in skin_registry.h (external
+// linkage: client_model.cpp calls it). Lives outside the anonymous namespace so
+// the declaration and definition are the same entity; the table itself stays
+// anonymous-namespace-local to this translation unit.
+const KelVariant* KelVariantTint(const std::string& name) {
+    for (const auto& v : kKelVariants)
+        if (name == v.name) return &v;
+    return nullptr;
+}
 
 bool IsValidSkinName(const std::string& name) {
     if (name.empty() || name.size() > 48) return false;
