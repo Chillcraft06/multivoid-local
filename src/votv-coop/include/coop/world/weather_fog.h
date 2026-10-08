@@ -1,20 +1,15 @@
-// coop/world/weather_fog.h -- host-authoritative FOG sync.
+// coop/world/weather_fog.h -- host-authoritative FOG sync (MTA CBlendedWeather::DoPulse).
 //
-// Fog is not a flag. enable_fog and enable_superfog are persistent CONFIG gates; the ACTIVE
-// fog is an event ACTOR -- an AweatherFogController_C in the cycle's fogEventObject slot for
-// rolling fog, a live AsuperFog_C found by class for super fog, a live AblackFog_C found by
-// class for black fog -- each ramping the height-fog density over its own Duration from its
-// own tick, then destroying itself. The
-// BASE ambient density is shared, time-of-day driven through an identical unsuppressed tick,
-// so host-clear to client-clear needs only actor destruction, never a density float.
-//
-// So the lane asserts the host's ACTOR PRESENCE (MTA CBlendedWeather::DoPulse): flags2
-// carries kFogActive, kSuperFogActive, kBlackFogActive and kPermanentFog, the host stamps
-// them, and the client suppresses its own spawnFog and asserts what the host reports. The
-// rolling actor self-destructs with NO observable UFunction, so the scheduler observers
-// miss the fog END and HostFogStateChanged supplies the edge. Super-fog SPAWN is deferred,
-// leaving this lane clear-only for it; black fog mirror-spawns through the gamemode's own
-// spawnBlackFog with the echo raised. docs/events-and-weather.md is the player-facing page.
+// Fog is not a flag: enable_fog/enable_superfog are persistent CONFIG gates; the ACTIVE fog
+// is an event ACTOR (AweatherFogController_C in the cycle's fogEventObject slot, AsuperFog_C
+// and AblackFog_C found by class), each ramping height-fog density over its own Duration then
+// destroying itself. BASE ambient density is shared and time-of-day driven, so host-clear to
+// client-clear is actor destruction only, never a density float. flags2 carries kFogActive,
+// kSuperFogActive, kBlackFogActive, kPermanentFog; clients suppress their own spawnFog and
+// assert the host's bits. The rolling actor's END has no observable UFunction, so
+// HostFogStateChanged supplies the edge; super-fog spawn is deferred (clear-only), black fog
+// mirror-spawns through the gamemode's spawnBlackFog with the echo raised. Player page:
+// docs/events-and-weather.md.
 
 #pragma once
 

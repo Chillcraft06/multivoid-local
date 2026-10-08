@@ -1,22 +1,12 @@
 // coop/world/balance_sync.h -- shared host-authoritative credit balance (saveSlot.Points).
 //
-// The HOST owns the canonical balance. It POLLS Points each game-thread tick -- catching every
-// writer: shop orders, signal-disk sells, task rewards, the +1000 dev button -- and broadcasts
-// BalanceSync on CHANGE, and to a joining client on its connect edge, so every peer MIRRORS the
-// host's balance. The CLIENT writes the host's absolute value directly, with no AddPoints
-// side-effects -- the MTA server-economy shape. SetSession, Tick and the connect edge run on the
-// net-pump game thread, and a received value is stashed for Tick to write.
-//
-// THE WIRE IS HOST-AUTHORITATIVE. BalanceSync itself is one-way, host to client: the host polls
-// Points and broadcasts the absolute value. The one exception is ClientCredit: a connected client
-// may send a BOUNDED, rate-limited ADD -- never a set, never a debit -- naming an amount its own
-// game just credited locally (a point sack, a chest, an achievement, an E-press coin) that no
-// other lane carries. The host validates the bound and the rate and applies it through AddPoints;
-// the next poll broadcasts the new total, so a client's earnings survive instead of being erased
-// by the broadcast. This is the bounded successor to the retired BalanceDelta: the old lane let
-// any peer set the balance to anything; this one only ever adds, within a bound, at a limited
-// rate. (The old lane's other successor is OrderRequest, where the client sends list_store row
-// names and the HOST prices and charges the order -- coop/items/order_sync.)
+// The HOST owns the canonical balance: it POLLS Points each tick and broadcasts BalanceSync on
+// change (and to joiners); clients mirror the absolute value with no AddPoints side-effects.
+// THE WIRE IS HOST-AUTHORITATIVE, with one exception: ClientCredit lets a client send a
+// BOUNDED, rate-limited ADD -- never a set or debit -- for earnings its own game credited
+// locally (sacks, chests, achievements, E-press coins) that no other lane carries. The host
+// validates, applies, and rebroadcasts, so client earnings survive. The bounded successor to
+// the retired BalanceDelta; OrderRequest is the other successor (coop/items/order_sync).
 
 #pragma once
 
