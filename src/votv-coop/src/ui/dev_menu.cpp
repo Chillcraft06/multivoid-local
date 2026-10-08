@@ -2,6 +2,7 @@
 
 #include "ui/dev_menu.h"
 
+#include "ue_wrap/core/log.h"
 #include "coop/dev/dev_gate.h"
 #include "coop/dev/event_force.h"
 #include "coop/dev/event_trigger.h"
