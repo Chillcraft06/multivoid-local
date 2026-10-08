@@ -41,6 +41,9 @@
 #include <string>
 #include <vector>
 
+#include <windows.h>
+#include <shellapi.h>
+
 #include "imgui.h"
 
 namespace ui::dev_menu {
@@ -560,10 +563,105 @@ void RenderAdminPlayers() { ui::admin_panel::Render(); }
 // owns the pane: the rules in force on this peer, laid out as the game's own pane).
 void RenderWorldRules() { ui::world_rules_panel::Render(); }
 
+// ---- Mod > Update: the self-updater ----------------------------------------
+// One-click updates, no manual reinstall. The button launches
+// dist/updater.ps1 (shipped at the mod root), which checks the rolling
+// dev-latest GitHub release, downloads it, closes the game, swaps the files,
+// and relaunches. All the logic lives in the script; here is only the path
+// resolution and the ShellExecuteW handoff.
+
+// This DLL lives at <game>/Binaries/Win64/Mods/Multivoid/dlls/main.dll, so
+// the mod root is the folder two levels up. Resolved once, then cached.
+std::wstring UpdaterModDir() {
+    static std::wstring s_dir;
+    static bool s_done = false;
+    if (s_done) return s_dir;
+    s_done = true;
+    HMODULE hMod = nullptr;
+    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCWSTR>(&UpdaterModDir), &hMod) ||
+        !hMod)
+        return s_dir;
+    wchar_t path[MAX_PATH] = {};
+    if (!::GetModuleFileNameW(hMod, path, MAX_PATH)) return s_dir;
+    std::wstring p(path);
+    const wchar_t* kTail = L"\\dlls\\main.dll";
+    const size_t n = wcslen(kTail);
+    if (p.size() > n && _wcsicmp(p.c_str() + p.size() - n, kTail) == 0) {
+        s_dir = p.substr(0, p.size() - n);
+    } else {
+        const size_t slash = p.find_last_of(L"\\/");
+        s_dir = (slash == std::wstring::npos) ? L"" : p.substr(0, slash);
+    }
+    return s_dir;
+}
+
+void LaunchUpdaterScript() {
+    const std::wstring modDir = UpdaterModDir();
+    if (modDir.empty()) {
+        UE_LOGW("updater: could not resolve the mod folder");
+        return;
+    }
+    const std::wstring ps1 = modDir + L"\\updater.ps1";
+    if (::GetFileAttributesW(ps1.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        UE_LOGW("updater: updater.ps1 missing from the mod folder (install a build that ships it)");
+        return;
+    }
+    wchar_t gameExe[MAX_PATH] = {};
+    ::GetModuleFileNameW(nullptr, gameExe, MAX_PATH);
+    const std::wstring args = L"-NoProfile -ExecutionPolicy Bypass -File \"" + ps1 +
+        L"\" -GamePid " + std::to_wstring(::GetCurrentProcessId()) +
+        L" -GameExe \"" + gameExe + L"\" -ModDir \"" + modDir + L"\"";
+    const INT_PTR r = reinterpret_cast<INT_PTR>(
+        ::ShellExecuteW(nullptr, L"open", L"powershell.exe", args.c_str(), nullptr, SW_SHOWNORMAL));
+    if (r <= 32)
+        UE_LOGW("updater: ShellExecuteW failed (%lld)", static_cast<long long>(r));
+    else
+        UE_LOGW("updater: launched updater.ps1");
+}
+
+void RenderModUpdate() {
+    ImGui::TextWrapped(
+        "Install the latest build without reinstalling by hand. The updater checks "
+        "the dev-latest release, downloads it, closes the game, installs it, and "
+        "reopens the game. A PowerShell window shows progress.");
+    static std::string s_ver;
+    static bool s_verRead = false;
+    if (!s_verRead) {
+        s_verRead = true;
+        const std::wstring modDir = UpdaterModDir();
+        if (!modDir.empty()) {
+            const std::wstring vf = modDir + L"\\installed_version.txt";
+            FILE* f = nullptr;
+            if (_wfopen_s(&f, vf.c_str(), L"r") == 0 && f) {
+                char buf[128] = {};
+                if (std::fgets(buf, sizeof(buf), f)) {
+                    const char* hex = std::strstr(buf, "commit:");
+                    hex = hex ? hex + 7 : buf;
+                    while (*hex == ' ') ++hex;
+                    char shortSha[13] = {};
+                    size_t i = 0;
+                    while (i < 12 && hex[i] &&
+                           ((hex[i] >= '0' && hex[i] <= '9') || (hex[i] >= 'a' && hex[i] <= 'f'))) {
+                        shortSha[i] = hex[i];
+                        ++i;
+                    }
+                    if (i > 0) s_ver.assign(shortSha, i);
+                }
+                std::fclose(f);
+            }
+        }
+    }
+    ImGui::TextDisabled("Installed: %s", s_ver.empty() ? "unknown (set on first update)" : s_ver.c_str());
+    if (ImGui::Button("Check for updates and install")) LaunchUpdaterScript();
+}
+
 // ---- the strict nested taxonomy (refined as features land) -------------------
 // Organized by the GAME'S OWN DOMAINS: Player (the person) ; World (the simulation
 // state: rules/weather/clock/economy) ; Content (the game's spawnable/triggerable
-// content: entities + events) ; Network ; Administration ; Cosmetics ; Report a bug
+// content: entities + events) ; Network ; Administration ; Cosmetics ; Mod (the
+// mod itself: updates) ; Report a bug
 // (the bug-report form) -- there is no catch-all category, per the folder-concept
 // rule. Network subs are placeholders.
 const std::vector<Cat>& Tree() {
@@ -607,6 +705,9 @@ const std::vector<Cat>& Tree() {
             { "Nameplate", { { &RenderNameplatePref, false } }, false },
             { "Chat",      { { &RenderChatPref, false } }, false },
             { "Interface", { { &RenderFontPref, false } }, false },
+        }, false },
+        { "Mod", {
+            { "Update", { { &RenderModUpdate, false } }, false },
         }, false },
         { "Report a bug", {
             { "Report", { { &ui::bug_report_pane::Render, false } }, false },

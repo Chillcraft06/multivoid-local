@@ -174,6 +174,13 @@ if ($Release) {
 # enabled.txt: UE4SS reads the FILE'S PRESENCE, and the field packages ship it with
 # the literal "true" inside. Match them rather than shipping an empty file.
 Set-Content -LiteralPath (Join-Path $stage 'mod/enabled.txt') -Value 'true' -Encoding ascii -NoNewline
+# The self-updater (F1 > Mod > Update) ships at the mod root. It is ours, not
+# upstream's: fail closed if it is missing rather than ship a mod whose update
+# button launches nothing.
+$updaterSrc = Join-Path $repoRoot 'dist/updater.ps1'
+if (-not (Test-Path -LiteralPath $updaterSrc)) { throw "updater script missing: $updaterSrc" }
+Copy-Item $updaterSrc (Join-Path $stage 'mod/updater.ps1')
+Write-Host 'updater: staged mod/updater.ps1'
 
 # --- Pak route (pak\ -> shimloader\pak\<pkg>\ -> VFS LogicMods\<pkg>\) --
 # When -Pak is not given the default input is assets/paks/: the staged starter-model

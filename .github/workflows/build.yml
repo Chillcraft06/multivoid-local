@@ -42,3 +42,34 @@ jobs:
       ref: ${{ github.sha }}
       source-sha: ${{ github.sha }}
       use-cache: ${{ !inputs.cacheless }}
+
+  # Publish the built zip to a rolling dev-latest release. This is the
+  # distribution channel the in-game updater (F1 > Mod > Update) reads:
+  # one tag, always the newest manual build, SHA in the notes for the
+  # version check. Needs contents:write, which the build job must not have.
+  publish:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: ./dist
+
+      - name: Publish rolling dev-latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="dev-latest"
+          SHA="${{ github.sha }}"
+          gh release delete "$TAG" --cleanup-tag -y || true
+          gh release create "$TAG" ./dist/*.zip \
+            --title "dev-latest" \
+            --prerelease \
+            --notes "sha: $SHA
+
+          Rolling development build of the private Multivoid fork.
+          The in-game updater (F1 > Mod > Update) installs this."
