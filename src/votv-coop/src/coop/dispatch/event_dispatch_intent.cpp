@@ -32,6 +32,7 @@
 #include "coop/items/broom_stroke.h"
 #include "coop/interactables/upgrade_sync.h"  // CLIENT->HOST upgrade purchase
 #include "coop/props/trash_channel.h"
+#include "coop/world/balance_sync.h"  // CLIENT->HOST observed earning (ClientCredit)
 
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/core/types.h"  // ue_wrap::FVector (ThrowIntent camFwd)
@@ -100,6 +101,25 @@ bool HandleIntentEvent(net::Session& session,
         }
         coop::coingun_sync::OnCoinCollect(msg.payload, static_cast<int>(msg.payloadLen),
                                           static_cast<uint8_t>(msg.senderPeerSlot), localPlayer);
+        break;
+    }
+    case net::ReliableKind::ClientCredit: {
+        // balance_sync: a CLIENT's observed local earning (a point sack, a chest, an achievement,
+        // an E-press coin) that no other lane carries. The host validates a per-intent bound and a
+        // per-slot rate, then credits the shared balance; the next poll broadcasts the new total,
+        // so the earning survives instead of being erased by the broadcast. HOST-TERMINAL --
+        // never relayed. CLIENT->HOST only.
+        if (msg.senderPeerSlot < 1 || msg.senderPeerSlot >= net::kMaxPeers) {
+            UE_LOGW("event_feed: ClientCredit from invalid senderPeerSlot=%d -- dropping",
+                    msg.senderPeerSlot);
+            break;
+        }
+        if (session.role() != net::Role::Host) {
+            UE_LOGW("event_feed: ClientCredit received off the HOST -- dropping");
+            break;
+        }
+        coop::balance_sync::OnClientCredit(msg.payload, static_cast<int>(msg.payloadLen),
+                                           static_cast<uint8_t>(msg.senderPeerSlot));
         break;
     }
     case net::ReliableKind::CoinGunResult: {

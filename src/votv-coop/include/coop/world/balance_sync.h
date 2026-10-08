@@ -7,12 +7,16 @@
 // side-effects -- the MTA server-economy shape. SetSession, Tick and the connect edge run on the
 // net-pump game thread, and a received value is stashed for Tick to write.
 //
-// THE WIRE IS ONE-WAY, HOST TO CLIENT. A client-to-host BalanceDelta request lane once existed and
-// the host applied it through AddPoints with NO value bound, so any peer could set the shared
-// balance to plus or minus 2^31. It was retired whole rather than clamped: a clamp keeps a
-// client-authored economy lane alive as a foothold and needs a "legitimate range" nobody can
-// define. Its successor is OrderRequest, where the client sends list_store row names and the HOST
-// prices and charges the order (coop/items/order_sync).
+// THE WIRE IS HOST-AUTHORITATIVE. BalanceSync itself is one-way, host to client: the host polls
+// Points and broadcasts the absolute value. The one exception is ClientCredit: a connected client
+// may send a BOUNDED, rate-limited ADD -- never a set, never a debit -- naming an amount its own
+// game just credited locally (a point sack, a chest, an achievement, an E-press coin) that no
+// other lane carries. The host validates the bound and the rate and applies it through AddPoints;
+// the next poll broadcasts the new total, so a client's earnings survive instead of being erased
+// by the broadcast. This is the bounded successor to the retired BalanceDelta: the old lane let
+// any peer set the balance to anything; this one only ever adds, within a bound, at a limited
+// rate. (The old lane's other successor is OrderRequest, where the client sends list_store row
+// names and the HOST prices and charges the order -- coop/items/order_sync.)
 
 #pragma once
 
@@ -50,9 +54,23 @@ void SendCurrentToSlot(int slot);
 void ApplyFromHost(int32_t total);
 
 // Apply a LOCAL credit (the +1000 dev button) on the host or solo, through AddPoints. On a
-// connected CLIENT this REFUSES and logs: there is no client-to-host economy write at all. Safe
-// from the render thread (the menu).
+// connected CLIENT this REFUSES and logs: the dev button is not an earning, and the only
+// client-to-host economy write is ClientCredit for observed game earnings (see OnClientCredit).
+// Safe from the render thread (the menu).
 void CreditLocal(int32_t amount);
+
+// HOST receiver (event_feed thread): a client's observed local earning. Validates the
+// per-intent bound and the per-slot rate, then credits the shared balance through AddPoints on
+// the game thread; the next Tick poll broadcasts the new total. Drops anything out of bound or
+// over rate with a log line. No-op unless this peer is the host.
+void OnClientCredit(const uint8_t* payload, int len, uint8_t senderSlot);
+
+// GAME THREAD: note that a forwarded coin collect (CoinCollect) is about to credit this client
+// locally by `amount`. The E-press entry is uncancellable, so after the gate the game's own
+// credit runs here; the host separately performs the forwarded collect. The earnings poll in
+// Tick consumes this note before forwarding, so one coin credits the shared balance once, not
+// twice. (The overlap entry cancels the local credit outright, so it never notes.)
+void NoteForwardedCredit(int32_t amount);
 
 // Reset the broadcast dedup on session teardown (so a reconnect re-broadcasts).
 void OnDisconnect();

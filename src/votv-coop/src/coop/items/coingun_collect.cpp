@@ -18,6 +18,7 @@
 #include "coop/player/players_registry.h"   // IsLocal, IsPuppet: who tripped the coin
 #include "coop/player/roster_ledger.h"   // PerSlotState: throttles that leave with their sender
 #include "coop/net/session.h"
+#include "coop/world/balance_sync.h"
 #include "coop/world/world_actor_sync.h"
 
 #include "ue_wrap/core/cached_obj_ref.h"
@@ -249,7 +250,17 @@ sg::Verdict OnCollectVerb(const sg::Call& b) {
     // Not refused here by choice (the lane forwards and reconciles): the local credit and the local self-destroy of our mirror
     // happen; the phantom credit is corrected by the balance broadcast, and the mirror's absence by
     // the host's WorldActorDestroy, or by the re-announce below.
-    ForwardCollectToHost(b.object, L"press");
+    //
+    // The local credit WILL run after this gate returns, and balance_sync's earnings poll would see
+    // it as an unforwarded earning and send it again -- one coin, two credits. So a successful
+    // forward notes the coin's value there first; the poll consumes the note instead of
+    // re-forwarding. (The overlap entry cancels the local credit outright, so it never notes.)
+    if (ForwardCollectToHost(b.object, L"press")) {
+        const int32_t pts = ReadCoinPoints(b.object);
+        if (pts > 0) coop::balance_sync::NoteForwardedCredit(pts);
+        else UE_LOGW("coingun[collect seam] entry=press forwarded but the coin's points are "
+                     "unreadable (%d) -- the earnings poll may re-forward this credit", pts);
+    }
     return sg::Verdict::Run;
 }
 

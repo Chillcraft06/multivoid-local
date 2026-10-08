@@ -629,6 +629,14 @@ enum class ReliableKind : uint8_t {
     // runs the coin's own verb. CoinCollectPayload.
     CoinCollect = 124,
 
+    // Client to host: my game just credited me this amount locally (a point sack, a chest, an
+    // achievement, a coin the E-press credited) and no other lane carries it -- please add it to
+    // the shared balance. The host validates a per-intent bound and a per-slot rate, then
+    // AddPoints; the next balance poll broadcasts the new total. This is the bounded successor
+    // to the retired BalanceDelta: the old lane let any peer SET the balance to anything; this
+    // one only ever ADDS, within a bound, at a limited rate. ClientCreditPayload.
+    ClientCredit = 128,
+
     // Host to one client: what your sale did: sold with the host's price, or a named refusal.
     // CoinGunResultPayload.
     CoinGunResult = 123,
@@ -2604,6 +2612,13 @@ struct BalancePayload {
     int32_t value;
 };
 static_assert(sizeof(BalancePayload) == 4, "BalancePayload must be exactly 4 bytes");
+
+// A client's observed local earning (ClientCredit), client to host: add this to the shared
+// balance. Always positive; the host enforces the bound and the rate.
+struct ClientCreditPayload {
+    int32_t amount;
+};
+static_assert(sizeof(ClientCreditPayload) == 4, "ClientCreditPayload must be exactly 4 bytes");
 
 // The slot assignment (AssignPeerSlot), host to one client: the slot and the host's own Player
 // element id, which the client mirrors in slot 0 so the host's packets resolve to a Player.
