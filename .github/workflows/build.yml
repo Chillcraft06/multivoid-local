@@ -65,10 +65,12 @@ jobs:
         run: |
           TAG="dev-latest"
           SHA="${{ github.sha }}"
-          gh release delete "$TAG" --cleanup-tag -y || true
+          REPO="${{ github.repository }}"
+          gh release delete "$TAG" --cleanup-tag -y -R "$REPO" || true
           gh release create "$TAG" ./dist/*.zip \
             --title "dev-latest" \
             --prerelease \
+            -R "$REPO" \
             --notes "sha: $SHA
 
           Rolling development build of the private Multivoid fork.
