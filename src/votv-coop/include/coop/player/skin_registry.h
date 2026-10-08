@@ -78,6 +78,19 @@ bool IsValidSkinName(const std::string& name);
 // any thread.
 const wchar_t* BuiltinSkinPath(const std::string& name);
 
+// Kel hair-color variants: the native dr_kel mesh with the hair material slot tinted.
+// A variant needs no pak and no asset path -- it rides the pristine native body, so the
+// mesh, the skeleton and the AnimBP are Kel's own by construction. The tint is a linear RGB
+// multiplier the hair discovery in client_model applies through a verified vector parameter
+// on the hair slot; the slot index and the parameter NAME are game-asset facts discovered at
+// runtime, not tabled here. nullptr when `name` is not a variant. Pure table lookup;
+// any thread.
+struct KelVariant {
+    const char* name;  // the wire name, announced like any skin
+    float r, g, b;     // linear-space multiplier over the native hair
+};
+const KelVariant* KelVariantTint(const std::string& name);
+
 // The catalog: entry 0 = dr_kel, then the builtin kerfur skins, then the skins the
 // installed paks provide -- one entry per single-skin pak's stem, or one entry per
 // MEMBER for a bundle pak (invalid stems skipped + logged; a pak shadowing a builtin

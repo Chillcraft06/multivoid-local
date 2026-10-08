@@ -72,6 +72,25 @@ bool SetTextureParameterValue(void* materialInstanceDynamic, const wchar_t* para
 bool SetScalarParameterValue(void* materialInstanceDynamic, const wchar_t* paramName, float value);
 bool SetScalarParameterValue(void* materialInstanceDynamic, const reflection::FName& param, float value);
 
+// UMaterialInstanceDynamic::SetVectorParameterValue (a linear-space RGBA multiplier the material
+// wires wherever the parameter feeds the graph). Game thread.
+bool SetVectorParameterValue(void* materialInstanceDynamic, const wchar_t* paramName,
+                             const FLinearColor& value);
+
+// UMaterialInstanceDynamic::K2_GetVectorParameterValue (the pure Blueprint getter; the native
+// GetVectorParameterValue takes an out-param whose frame name is not stable across builds, so
+// the K2 form is the only one resolved). False when the function does not resolve or the
+// parameter is unknown -- a readback a caller uses to VERIFY a set landed, never a value to
+// trust on its own. Game thread.
+bool GetVectorParameterValue(void* materialInstanceDynamic, const wchar_t* paramName,
+                             FLinearColor& outValue);
+
+// UMeshComponent::GetNumMaterials / GetMaterial: the material slots of a mesh component, for
+// inspection (a skin probe reads them; gameplay never does). -1 / nullptr when unresolved.
+// Game thread.
+int32_t GetNumMaterials(void* component);
+void* GetMaterialAt(void* component, int32_t elementIndex);
+
 // UStaticMeshComponent::SetStaticMesh, resolved on the owning class; recomputes bounds and
 // collision. Rejects null: a caller that has failed to resolve a mesh and one that means "no mesh"
 // pass the same argument, and blanking a component is the wrong answer to the first. Game thread.

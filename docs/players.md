@@ -112,7 +112,13 @@ skin unchanged; only the mesh and one texture parameter swap. Three sources
 asset path, with the variant's effect rig rebuilt on the player body, the face screen, the glow
 and the particles (`coop/player/skin_effects`); and converter paks under the game's mod pak
 folder, where a single-skin pak's file stem is the skin's name. The starter bundle carries four
-scientists, and a new identity rolls one of them at random. The local first-person body wears the
+scientists, and a new identity rolls one of them at random. Five kel hair-color variants
+(`kel_raven`, `kel_chestnut`, `kel_copper`, `kel_ash`, `kel_frost`) ride the native dr_kel mesh
+with the hair slot tinted: the slot and the tintable vector parameter are discovered once per
+process from the live mesh (first material named `*hair*`, first candidate parameter that
+round-trips set-then-read), cached, and logged; a failed discovery renders plain dr_kel and says
+so in the log. The tint multiplies the authored hair, so darker shades land exactly and lighter
+ones approximate. The local first-person body wears the
 same skin as the puppet and is re-applied across pawn generations (`coop/player/local_body`).
 A peer without a pak sees the stock body, by design; nothing is downloaded from another peer.
 The F1 skins panel previews a skin on a live mannequin (`coop/player/skin_preview`,

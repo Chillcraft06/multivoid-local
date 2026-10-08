@@ -107,8 +107,9 @@ bool RemotePlayer::Spawn(const std::string& skinName) {
 
     // The puppet wears the skin this peer announced (docs/players.md); every converter pak shares
     // the kerfurOmegaV1 skeleton, so the local AnimClass drives it. A pak missing on this machine
-    // degrades to the kel baseline.
-    if (!coop::client_model::IsNativeSkin(skinName)) {
+    // degrades to the kel baseline. Kel variants ride the native mesh (the tint applies later,
+    // in ApplySkinToBody), so they skip the pak lookup like the stock body.
+    if (!coop::client_model::UsesNativeMesh(skinName)) {
         if (void* customMesh = coop::client_model::GetSkinMesh(skinName)) {
             skin = customMesh;
             UE_LOGI("RemotePlayer::Spawn: skin '%s' -> mesh %p (anthro AnimClass %p kept)",

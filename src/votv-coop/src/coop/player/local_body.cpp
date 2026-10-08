@@ -216,7 +216,7 @@ void Tick() {
     const auto now = clock::now();
     if (now - g_lastConverge < std::chrono::seconds(1)) return;
     g_lastConverge = now;
-    void* expected = coop::client_model::IsNativeSkin(g_appliedSkin)
+    void* expected = coop::client_model::UsesNativeMesh(g_appliedSkin)
                          ? g_native
                          : coop::client_model::GetSkinMesh(g_appliedSkin);
     if (!expected) return;

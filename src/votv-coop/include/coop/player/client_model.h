@@ -18,6 +18,11 @@ namespace coop::client_model {
 // True for "" / "dr_kel": the stock body (no pak assets involved).
 bool IsNativeSkin(const std::string& name);
 
+// True when the skin rides the captured native mesh: the stock body AND the kel hair-color
+// variants (skin_registry::KelVariantTint). Callers choosing between `nativeMesh` and
+// `GetSkinMesh` ask this, not IsNativeSkin.
+bool UsesNativeMesh(const std::string& name);
+
 // The cooked USkeletalMesh for `name`, lazily loaded from the auto-mounted pak. Per-name cache with
 // GUObjectArray-slot liveness revalidation: a level-change GC can collect a pak asset, so a cached
 // hit is IsLiveByIndex-checked and re-loaded when stale -- a plain IsLive would miss the
@@ -51,6 +56,8 @@ Wearable CanWearSkin(const std::string& name);
 //   custom skin: SetSkeletalMesh(mesh) twice, then a slot-0 MID 'tex' override twice.
 //   dr_kel:      SetSkeletalMesh(nativeMesh) twice, then SetMaterial(0, null) twice, clearing a
 //                previous skin's MID so kel does not wear our atlas.
+//   kel variant: dr_kel's path, then the hair-slot tint (see the KelVariant discovery below):
+//                the native mesh with one verified vector-parameter MID on the hair slot.
 // `nativeMesh` is the pristine kel asset (local_body::NativeBodyMesh(), or the spawn-time
 // baseline). Returns false when nothing was applied -- a custom mesh that would not resolve, or a
 // null nativeMesh on a dr_kel apply -- and the caller keeps the current body; the miss is logged.

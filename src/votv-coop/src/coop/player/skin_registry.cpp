@@ -82,6 +82,25 @@ const SkinBundle* BundleForStem(const std::string& stem) {
     return nullptr;
 }
 
+// Kel hair-color variants. Linear-space multipliers over the native hair: a tint MULTIPLIES
+// the authored hair, so darker shades land exactly and lighter ones approximate -- the
+// picker shows what the game renders, and the log names the verified slot and parameter.
+// Names are wire names (IsValidSkinName-shaped) announced in Join/SkinChange like any skin;
+// a peer on a build without the variant falls back to its own body, never a crash.
+constexpr KelVariant kKelVariants[] = {
+    { "kel_raven",   0.10f, 0.10f, 0.12f },  // near-black
+    { "kel_chestnut", 0.45f, 0.23f, 0.13f },  // auburn brown
+    { "kel_copper",  0.64f, 0.27f, 0.13f },  // copper red
+    { "kel_ash",     0.62f, 0.60f, 0.58f },  // ash grey
+    { "kel_frost",   0.86f, 0.87f, 0.91f },  // silver white
+};
+
+const KelVariant* KelVariantTint(const std::string& name) {
+    for (const auto& v : kKelVariants)
+        if (name == v.name) return &v;
+    return nullptr;
+}
+
 bool DirProvidesSkin(const std::wstring& dirW, const char* skin) {
     std::error_code ec;
     fs::path own = fs::path(dirW) / skin;
@@ -183,6 +202,11 @@ const std::vector<SkinEntry>& Entries(bool rescan) {
     g_scanned = true;
     g_entries.clear();
     g_entries.push_back({kNativeSkinName, L""});  // the stock body is always offered
+
+    // Kel hair-color variants: the native mesh with a tinted hair slot (no pak, no asset
+    // path). They sort with the native body, before the kerfur builtins.
+    for (const auto& v : kKelVariants)
+        g_entries.push_back({v.name, L""});  // no preview tile yet: the mannequin IS the preview
 
     const std::vector<std::wstring> dirs = PakDirs();
 
@@ -312,7 +336,8 @@ void ResolvePending(int budget) {
         // The stock body, because reaching here means no starter pak is installed. The retired
         // kDefaultSkinName was itself a pak skin, so naming it here handed a fresh identity a skin
         // that by construction could not resolve either. dr_kel needs no pak.
-        if (name.empty() || name == kNativeSkinName || BuiltinSkinPath(name)) {
+        if (name.empty() || name == kNativeSkinName || BuiltinSkinPath(name) ||
+            KelVariantTint(name)) {
             std::lock_guard<std::mutex> lk(g_usableMu);
             if (epoch == g_scanEpoch) g_verdicts[std::move(name)] = Usable::Yes;
             continue;   // deliberately NOT charged against `budget`

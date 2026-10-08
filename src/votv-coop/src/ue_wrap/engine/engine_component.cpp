@@ -228,6 +228,69 @@ bool SetScalarParameterValue(void* materialInstanceDynamic, const wchar_t* param
                                    ue_wrap::fname_utils::StringToFName(paramName), value);
 }
 
+void* g_setVecParamFn = nullptr;   // UMaterialInstanceDynamic::SetVectorParameterValue
+void* g_getVecParamFn = nullptr;   // UMaterialInstanceDynamic::K2_GetVectorParameterValue
+
+bool SetVectorParameterValue(void* materialInstanceDynamic, const wchar_t* paramName,
+                             const FLinearColor& value) {
+    if (!materialInstanceDynamic || !paramName) return false;
+    if (!g_midClass) g_midClass = R::FindClass(L"MaterialInstanceDynamic");
+    if (g_midClass && !g_setVecParamFn)
+        g_setVecParamFn = R::FindFunction(g_midClass, L"SetVectorParameterValue");
+    if (!g_setVecParamFn) return false;
+    const R::FName pn = ue_wrap::fname_utils::StringToFName(paramName);
+    ParamFrame f(g_setVecParamFn);
+    if (!f.valid()) return false;
+    f.Set<R::FName>(L"ParameterName", pn);
+    f.Set<FLinearColor>(L"Value", value);
+    return Call(materialInstanceDynamic, f);
+}
+
+bool GetVectorParameterValue(void* materialInstanceDynamic, const wchar_t* paramName,
+                             FLinearColor& outValue) {
+    if (!materialInstanceDynamic || !paramName) return false;
+    if (!g_midClass) g_midClass = R::FindClass(L"MaterialInstanceDynamic");
+    if (g_midClass && !g_getVecParamFn)
+        g_getVecParamFn = R::FindFunction(g_midClass, L"K2_GetVectorParameterValue");
+    if (!g_getVecParamFn) return false;
+    const R::FName pn = ue_wrap::fname_utils::StringToFName(paramName);
+    ParamFrame f(g_getVecParamFn);
+    if (!f.valid()) return false;
+    f.Set<R::FName>(L"ParameterName", pn);
+    if (!Call(materialInstanceDynamic, f)) return false;
+    outValue = f.Get<FLinearColor>(L"ReturnValue");
+    return true;
+}
+
+void* g_meshCompClass = nullptr;   // UMeshComponent (owns GetNumMaterials / GetMaterial)
+void* g_getNumMatsFn = nullptr;
+void* g_getMaterialFn = nullptr;
+
+bool ResolveMeshMatFns() {
+    if (!g_meshCompClass) g_meshCompClass = R::FindClass(L"MeshComponent");
+    if (g_meshCompClass && !g_getNumMatsFn)
+        g_getNumMatsFn = R::FindFunction(g_meshCompClass, L"GetNumMaterials");
+    if (g_meshCompClass && !g_getMaterialFn)
+        g_getMaterialFn = R::FindFunction(g_meshCompClass, L"GetMaterial");
+    return g_getNumMatsFn && g_getMaterialFn;
+}
+
+int32_t GetNumMaterials(void* component) {
+    if (!component || !ResolveMeshMatFns()) return -1;
+    ParamFrame f(g_getNumMatsFn);
+    if (!f.valid() || !Call(component, f)) return -1;
+    return f.Get<int32_t>(L"ReturnValue");
+}
+
+void* GetMaterialAt(void* component, int32_t elementIndex) {
+    if (!component || elementIndex < 0 || !ResolveMeshMatFns()) return nullptr;
+    ParamFrame f(g_getMaterialFn);
+    if (!f.valid()) return nullptr;
+    f.Set<int32_t>(L"ElementIndex", elementIndex);
+    if (!Call(component, f)) return nullptr;
+    return f.Get<void*>(L"ReturnValue");
+}
+
 bool DestroyComponent(void* component, void* contextObject) {
     if (!component || !ResolveDestroy()) {
         UE_LOGE("engine: DestroyComponent unresolved (cls=%p fn=%p)",
