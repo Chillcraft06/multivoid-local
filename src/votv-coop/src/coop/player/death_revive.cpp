@@ -393,7 +393,7 @@ bool PickFriendTarget(coop::net::Session& session, const ue_wrap::FVector& from,
     float best = 0.f;
     for (int slot = 0; slot < coop::net::kMaxPeers; ++slot) {
         coop::net::PoseSnapshot pose{};
-        if (!session.TryGetRemotePose(slot, &pose)) continue;  // no pose: gone or never arrived
+        if (!session.TryGetRemotePose(slot, pose)) continue;  // no pose: gone or never arrived
         if (pose.healthFrac == 0) continue;                     // not a surviving friend
         const float dx = pose.x - from.X;
         const float dy = pose.y - from.Y;

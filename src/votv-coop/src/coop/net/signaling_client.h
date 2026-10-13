@@ -24,7 +24,7 @@
 #include <string>
 #include <unordered_map>
 
-#include "coop/net/signaling_crypto.h"  // SessionKey (the per-peer signaling-encryption cache)
+#include "signaling_crypto.h"  // SessionKey (the per-peer signaling-encryption cache)
 
 #pragma warning(push)
 #pragma warning(disable: 4100 4127 4191 4244 4245 4267 4310 4324 4458)

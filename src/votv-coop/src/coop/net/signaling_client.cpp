@@ -13,7 +13,7 @@
 
 #include "coop/net/endpoint_log.h"
 #include "coop/net/peer_identity.h"
-#include "coop/net/signaling_crypto.h"
+#include "signaling_crypto.h"
 #include "signaling_proof.h"
 #include "ue_wrap/core/log.h"
 

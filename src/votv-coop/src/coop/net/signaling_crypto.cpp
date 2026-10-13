@@ -28,6 +28,55 @@
 namespace coop::net::signaling_crypto {
 namespace {
 
+#if defined(_MSC_VER)
+#include <intrin.h>  // _umul128
+#endif
+
+// MSVC has no __uint128_t. Minimal 128-bit accumulator: two 64-bit limbs, little-endian.
+struct U128 { uint64_t lo = 0; uint64_t hi = 0; };
+
+static U128 U128Mul64(uint64_t a, uint64_t b) {
+    U128 r;
+#if defined(_MSC_VER)
+    r.lo = _umul128(a, b, &r.hi);
+#else
+    const __uint128_t t = (__uint128_t)a * b;
+    r.lo = (uint64_t)t; r.hi = (uint64_t)(t >> 64);
+#endif
+    return r;
+}
+static void U128Add(U128& acc, U128 v) {
+    const uint64_t lo = acc.lo + v.lo;
+    acc.hi += v.hi + (lo < acc.lo ? 1u : 0u);
+    acc.lo = lo;
+}
+static void U128Add64(U128& acc, uint64_t v) {
+    const uint64_t lo = acc.lo + v;
+    acc.hi += (lo < acc.lo ? 1u : 0u);
+    acc.lo = lo;
+}
+// v *= m; caller guarantees the result fits in 128 bits (fe_mul: 19 * t[i], t[i] < 2^107;
+// p1305_mul: 5 * hi, hi < 2^124).
+static void U128MulSmall(U128& v, uint64_t m) {
+    const U128 loP = U128Mul64(v.lo, m);
+    const U128 hiP = U128Mul64(v.hi, m);
+    v.lo = loP.lo;
+    v.hi = loP.hi + hiP.lo;  // hiP.hi << 128 is 0 by the caller bounds above
+}
+static U128 U128Shr(const U128& v, unsigned bits) {
+    U128 r;
+    if (bits >= 64) { r.lo = v.hi >> (bits - 64); r.hi = 0; }
+    else if (bits == 0) { r = v; }
+    else { r.lo = (v.lo >> bits) | (v.hi << (64 - bits)); r.hi = v.hi >> bits; }
+    return r;
+}
+static U128 U128Shl64(uint64_t v, unsigned bits) {  // bits < 128
+    U128 r;
+    if (bits < 64) { r.lo = v << bits; r.hi = bits ? v >> (64 - bits) : 0; }
+    else { r.lo = 0; r.hi = v << (bits - 64); }
+    return r;
+}
+
 // ---------------------------------------------------------------------------
 // SHA-256 / SHA-512 via CNG (mirrors peer_identity.cpp's Sha256).
 // ---------------------------------------------------------------------------
@@ -137,34 +186,34 @@ void fe_sub(Fe& h, const Fe& a, const Fe& b) {  // a, b < p
 
 void fe_mul(Fe& h, const Fe& a, const Fe& b) {  // a, b < p; h < p
     // Schoolbook into 128-bit accumulators: each product < 2^102, five per coefficient < 2^105.
-    __uint128_t t[10] = {};
+    U128 t[10] = {};
     for (int i = 0; i < 5; i++)
-        for (int j = 0; j < 5; j++) t[i + j] += (__uint128_t)a.v[i] * b.v[j];
+        for (int j = 0; j < 5; j++) U128Add(t[i + j], U128Mul64(a.v[i], b.v[j]));
     for (int i = 0; i < 9; i++) {
-        t[i + 1] += t[i] >> 51;
-        t[i] &= kMask51;
+        U128Add(t[i + 1], U128Shr(t[i], 51));
+        t[i].lo &= kMask51; t[i].hi = 0;
     }
     // Fold the high half with 2^255 == 19 (mod p).
     for (int i = 5; i < 10; i++) {
-        t[i - 5] += (__uint128_t)19 * t[i];
-        t[i] = 0;
+        U128 m = t[i]; U128MulSmall(m, 19); U128Add(t[i - 5], m);
+        t[i].lo = 0; t[i].hi = 0;
     }
     for (int i = 0; i < 5; i++) {
-        t[i + 1] += t[i] >> 51;
-        t[i] &= kMask51;
+        U128Add(t[i + 1], U128Shr(t[i], 51));
+        t[i].lo &= kMask51; t[i].hi = 0;
     }
-    t[0] += (__uint128_t)19 * t[5];
-    t[5] = 0;
+    { U128 m = t[5]; U128MulSmall(m, 19); U128Add(t[0], m); }
+    t[5].lo = 0; t[5].hi = 0;
     for (int i = 0; i < 5; i++) {
-        t[i + 1] += t[i] >> 51;
-        t[i] &= kMask51;
+        U128Add(t[i + 1], U128Shr(t[i], 51));
+        t[i].lo &= kMask51; t[i].hi = 0;
     }
-    t[0] += (__uint128_t)19 * t[5];
+    { U128 m = t[5]; U128MulSmall(m, 19); U128Add(t[0], m); }
     uint64_t carry = 0;
     for (int i = 0; i < 5; i++) {
-        const __uint128_t s = t[i] + carry;
-        h.v[i] = (uint64_t)(s & kMask51);
-        carry = (uint64_t)(s >> 51);
+        U128 s = t[i]; U128Add64(s, carry);
+        h.v[i] = s.lo & kMask51;
+        carry = (s.lo >> 51) | (s.hi << 13);  // s >> 51 fits in 64 bits: s < 2^115
     }
     fe_sub_p_cond(h);  // < 2^255 + 19*2^13 < 2p
 }
@@ -173,18 +222,20 @@ void fe_sq(Fe& h, const Fe& a) { fe_mul(h, a, a); }
 
 // h = a * n, n < 2^20. Used for the ladder's 121665 * E.
 void fe_mul_small(Fe& h, const Fe& a, uint64_t n) {
-    __uint128_t carry = 0;
+    // a.v[i] < 2^51 and n < 2^20, so a.v[i] * n needs up to 72 bits: the carry
+    // must stay 128-bit (a 64-bit carry would silently truncate the product).
+    U128 carry = U128{};
     for (int i = 0; i < 5; i++) {
-        carry += (__uint128_t)a.v[i] * n;
-        h.v[i] = (uint64_t)(carry & kMask51);
-        carry >>= 51;
+        U128Add(carry, U128Mul64(a.v[i], n));
+        h.v[i] = carry.lo & kMask51;
+        carry = U128Shr(carry, 51);
     }
-    h.v[0] += (uint64_t)(19 * carry);  // 2^255 == 19; carry < 2^20
-    carry = 0;
+    h.v[0] += 19 * carry.lo;  // 2^255 == 19; carry < 2^21 here
+    carry = U128{};
     for (int i = 0; i < 5; i++) {
-        const __uint128_t s = h.v[i] + carry;
-        h.v[i] = (uint64_t)(s & kMask51);
-        carry = s >> 51;
+        U128Add64(carry, h.v[i]);
+        h.v[i] = carry.lo & kMask51;
+        carry = U128Shr(carry, 51);
     }
     fe_sub_p_cond(h);
 }
@@ -445,20 +496,25 @@ void p1305_mul(P1305& h, const uint32_t r[4]) {
     }
     // Fold everything at and above 2^130: 2^130 == 5 (mod 2^130 - 5).
     // t[4] holds bits 128..; hi = t[4]>>2 covers bits 130+, plus 2^32*t[5] etc.
-    __uint128_t hi = (__uint128_t)(t[4] >> 2) + ((__uint128_t)t[5] << 30) +
-                    ((__uint128_t)t[6] << 62) + ((__uint128_t)t[7] << 94);
+    U128 hi = U128{};
+    U128Add64(hi, t[4] >> 2);
+    U128Add(hi, U128Shl64(t[5], 30));
+    U128Add(hi, U128Shl64(t[6], 62));
+    U128Add(hi, U128Shl64(t[7], 94));
     t[4] &= 3u;
-    __uint128_t c = 5 * hi;
+    U128 c = hi;
+    U128MulSmall(c, 5);
     for (int i = 0; i < 4; i++) {
-        c += t[i];
-        t[i] = (uint64_t)(c & 0xffffffffu);
-        c >>= 32;
+        U128Add64(c, t[i]);
+        t[i] = c.lo & 0xffffffffu;
+        c = U128Shr(c, 32);
     }
-    t[4] += (uint64_t)c;
+    t[4] += (uint64_t)c.lo;
     // One more fold: t[4] may again reach past bit 130.
-    hi = t[4] >> 2;
+    hi = U128{};
+    U128Add64(hi, t[4] >> 2);
     t[4] &= 3u;
-    t[0] += 5 * hi;
+    t[0] += 5 * hi.lo;
     for (int i = 0; i < 4; i++) {
         t[i + 1] += t[i] >> 32;
         t[i] &= 0xffffffffu;

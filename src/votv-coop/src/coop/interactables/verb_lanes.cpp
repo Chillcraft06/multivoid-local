@@ -8,7 +8,8 @@
 #include "coop/interactables/drone_call_intent.h"
 #include "coop/interactables/eraser_press_intent.h"
 #include "coop/furnace/furnace_sync.h"  // the furnace (cremator): door + fire + occupant + burn clear
-#include "coop/interactables/keypad_verbs.h"#include "coop/interactables/lightgroup_verbs.h"
+#include "coop/interactables/keypad_verbs.h"
+#include "coop/interactables/lightgroup_verbs.h"
 #include "coop/interactables/toggle_verbs.h"
 #include "coop/net/session.h"
 
