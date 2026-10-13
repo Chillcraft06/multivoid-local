@@ -1011,70 +1011,6 @@ enum class ReliableKind : uint8_t {
 
 #pragma pack(push, 1)
 
-// --- Overnight batch payload structs (2026-10-13) ---
-// FurnaceFirePayload (ReliableKind::FurnaceFireState=174): the furnace's fire switch plus who is
-// inside. occupantSlot is the owning peer slot, -1 when empty.
-struct FurnaceFirePayload {
-    WireKey  key;          // 32 -- the furnace actor's Key FName (string)
-    uint8_t  fireOn;       // 1  -- 0 = off, 1 = on (the state AFTER the edge)
-    int8_t   occupantSlot; // 1  -- peer slot inside the furnace, -1 = none
-    uint8_t  _pad[6];      // 6  -- reserved
-};
-static_assert(sizeof(FurnaceFirePayload) == 40, "FurnaceFirePayload must be 40 bytes");
-static_assert(sizeof(FurnaceFirePayload) <= 256 - 20 - 8,
-              "FurnaceFirePayload must fit in one reliable datagram");
-
-// FurnaceBurnClearPayload (ReliableKind::FurnaceBurnClear=175): clear one player's stuck burn
-// visuals and audio (the furnace death left them burning with no damage behind it).
-struct FurnaceBurnClearPayload {
-    uint32_t playerElementId; // 4 -- whose burn state to clear
-    uint8_t  _pad[4];         // 4 -- reserved
-};
-static_assert(sizeof(FurnaceBurnClearPayload) == 8, "FurnaceBurnClearPayload must be 8 bytes");
-
-// PlayerGrabPayload (ReliableKind::PlayerGrabState=176): player-to-player grab, drag and throw.
-// action: 0 = release, 1 = grab, 2 = drag (pos/yaw authoritative), 3 = throw (pos + vel).
-struct PlayerGrabPayload {
-    uint32_t grabberElementId; // 4
-    uint32_t targetElementId;  // 4
-    uint8_t  action;           // 1 -- 0 release, 1 grab, 2 drag, 3 throw
-    uint8_t  _pad[3];          // 3 -- reserved
-    float    pos[3];           // 12 -- drag: authoritative target position; throw: release pos
-    float    vel[3];           // 12 -- throw: release velocity (unused otherwise)
-    float    yaw;              // 4  -- drag: authoritative facing (unused otherwise)
-};
-static_assert(sizeof(PlayerGrabPayload) == 40, "PlayerGrabPayload must be 40 bytes");
-static_assert(sizeof(PlayerGrabPayload) <= 256 - 20 - 8,
-              "PlayerGrabPayload must fit in one reliable datagram");
-
-// PropHoldPayload (ReliableKind::PropHoldState=177): a prop's holder set. holderCount 0 =
-// released, 1 = held, 2 = contested tug-of-war. action mirrors the count edge (0 release,
-// 1 grab, 2 contest).
-struct PropHoldPayload {
-    WireKey  key;                // 32 -- the prop's Key FName (string)
-    uint32_t holderElementId[2]; // 8  -- up to two simultaneous holders
-    uint8_t  holderCount;        // 1  -- 0, 1 or 2
-    uint8_t  action;            // 1  -- 0 release, 1 grab, 2 contest
-    uint8_t  _pad[6];            // 6  -- reserved
-};
-static_assert(sizeof(PropHoldPayload) == 48, "PropHoldPayload must be 48 bytes");
-static_assert(sizeof(PropHoldPayload) <= 256 - 20 - 8,
-              "PropHoldPayload must fit in one reliable datagram");
-
-// WorldRulePayload (ReliableKind::WorldRuleState=178): one world rule changed by the host.
-// kind: 0 = bool (bval), 1 = enum (ival ordinal), 2 = float (fval).
-struct WorldRulePayload {
-    uint32_t ruleKeyHash; // 4 -- CRC32 of the RuleField key string (e.g. "fallDamage")
-    uint8_t  kind;        // 1 -- 0 bool, 1 enum, 2 float
-    uint8_t  _pad[3];     // 3 -- reserved
-    union {
-        uint8_t bval;     // kind 0
-        int32_t ival;     // kind 1
-        float   fval;     // kind 2
-    } value;              // 4
-    uint8_t _pad2[4];     // 4 -- reserved
-};
-static_assert(sizeof(WorldRulePayload) == 16, "WorldRulePayload must be 16 bytes");
 
 // Every datagram starts with this. seq is per sender and monotonic; the receiver drops anything
 // older than the last it saw. senderEpoch is the sender's per-process epoch, minted non-zero at
@@ -1203,6 +1139,71 @@ struct WireKey {
     char    data[31];  // UTF-8 (Aprop_C Keys are ASCII)
 };
 static_assert(sizeof(WireKey) == 32, "WireKey must be 32 bytes");
+
+// --- Overnight batch payload structs (2026-10-13) ---
+// FurnaceFirePayload (ReliableKind::FurnaceFireState=174): the furnace's fire switch plus who is
+// inside. occupantSlot is the owning peer slot, -1 when empty.
+struct FurnaceFirePayload {
+    WireKey  key;          // 32 -- the furnace actor's Key FName (string)
+    uint8_t  fireOn;       // 1  -- 0 = off, 1 = on (the state AFTER the edge)
+    int8_t   occupantSlot; // 1  -- peer slot inside the furnace, -1 = none
+    uint8_t  _pad[6];      // 6  -- reserved
+};
+static_assert(sizeof(FurnaceFirePayload) == 40, "FurnaceFirePayload must be 40 bytes");
+static_assert(sizeof(FurnaceFirePayload) <= 256 - 20 - 8,
+              "FurnaceFirePayload must fit in one reliable datagram");
+
+// FurnaceBurnClearPayload (ReliableKind::FurnaceBurnClear=175): clear one player's stuck burn
+// visuals and audio (the furnace death left them burning with no damage behind it).
+struct FurnaceBurnClearPayload {
+    uint32_t playerElementId; // 4 -- whose burn state to clear
+    uint8_t  _pad[4];         // 4 -- reserved
+};
+static_assert(sizeof(FurnaceBurnClearPayload) == 8, "FurnaceBurnClearPayload must be 8 bytes");
+
+// PlayerGrabPayload (ReliableKind::PlayerGrabState=176): player-to-player grab, drag and throw.
+// action: 0 = release, 1 = grab, 2 = drag (pos/yaw authoritative), 3 = throw (pos + vel).
+struct PlayerGrabPayload {
+    uint32_t grabberElementId; // 4
+    uint32_t targetElementId;  // 4
+    uint8_t  action;           // 1 -- 0 release, 1 grab, 2 drag, 3 throw
+    uint8_t  _pad[3];          // 3 -- reserved
+    float    pos[3];           // 12 -- drag: authoritative target position; throw: release pos
+    float    vel[3];           // 12 -- throw: release velocity (unused otherwise)
+    float    yaw;              // 4  -- drag: authoritative facing (unused otherwise)
+};
+static_assert(sizeof(PlayerGrabPayload) == 40, "PlayerGrabPayload must be 40 bytes");
+static_assert(sizeof(PlayerGrabPayload) <= 256 - 20 - 8,
+              "PlayerGrabPayload must fit in one reliable datagram");
+
+// PropHoldPayload (ReliableKind::PropHoldState=177): a prop's holder set. holderCount 0 =
+// released, 1 = held, 2 = contested tug-of-war. action mirrors the count edge (0 release,
+// 1 grab, 2 contest).
+struct PropHoldPayload {
+    WireKey  key;                // 32 -- the prop's Key FName (string)
+    uint32_t holderElementId[2]; // 8  -- up to two simultaneous holders
+    uint8_t  holderCount;        // 1  -- 0, 1 or 2
+    uint8_t  action;            // 1  -- 0 release, 1 grab, 2 contest
+    uint8_t  _pad[6];            // 6  -- reserved
+};
+static_assert(sizeof(PropHoldPayload) == 48, "PropHoldPayload must be 48 bytes");
+static_assert(sizeof(PropHoldPayload) <= 256 - 20 - 8,
+              "PropHoldPayload must fit in one reliable datagram");
+
+// WorldRulePayload (ReliableKind::WorldRuleState=178): one world rule changed by the host.
+// kind: 0 = bool (bval), 1 = enum (ival ordinal), 2 = float (fval).
+struct WorldRulePayload {
+    uint32_t ruleKeyHash; // 4 -- CRC32 of the RuleField key string (e.g. "fallDamage")
+    uint8_t  kind;        // 1 -- 0 bool, 1 enum, 2 float
+    uint8_t  _pad[3];     // 3 -- reserved
+    union {
+        uint8_t bval;     // kind 0
+        int32_t ival;     // kind 1
+        float   fval;     // kind 2
+    } value;              // 4
+    uint8_t _pad2[4];     // 4 -- reserved
+};
+static_assert(sizeof(WorldRulePayload) == 16, "WorldRulePayload must be 16 bytes");
 
 // A Blueprint class leaf name ("Aprop_equipment_flashlight_C"). Bytes beyond len are zero.
 struct WireClassName {
