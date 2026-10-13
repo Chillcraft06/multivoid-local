@@ -56,6 +56,7 @@ void DestroySeamBody(void* self) {
     if (coop::prop_echo_suppress::IsIncomingDestroy(self)) {
         UE_LOGI("grab_hook[destroy-seam]: actor %p was wire-received destroy -- skip rebroadcast",
                 self);
+        UE_LOGI("propdestroy: destroy of actor %p echo-suppressed -- not rebroadcast", self);
         return;
     }
     if (!ue_wrap::prop::IsKeyedInteractable(self)) return;
@@ -103,6 +104,11 @@ void DestroySeamBody(void* self) {
                         (destroyEid == coop::element::kInvalidId) ? 0u
                                                                   : static_cast<unsigned>(destroyEid));
             }
+            UE_LOGI("propdestroy: CLIENT keyed destroy SUPPRESSED in reconcile window key='%ls' eid=%u "
+                    "-- never crossed to the host (divergence risk, not a dup)",
+                    keyStr.c_str(),
+                    (destroyEid == coop::element::kInvalidId) ? 0u
+                                                              : static_cast<unsigned>(destroyEid));
             return;
         }
         UE_LOGI("grab_hook[destroy-seam]: CLIENT suppressed %s DESTROY actor=%p key='%ls' eid=%u "
@@ -138,6 +144,11 @@ void DestroySeamBody(void* self) {
     UE_LOGI("grab_hook[destroy-seam]: %s broadcasting DESTROY actor=%p key='%ls' eid=%u%s",
             roleStr, self, keyless ? L"None" : keyStr.c_str(), dp.elementId,
             keyless ? " (eid-only: trash clump)" : "");
+    // The bolted-state proxy: the mod has no bolt flag, so frozen/static is what the live test
+    // reads to tell "destroyed while still bolted" from "destroyed after the unbolt".
+    UE_LOGI("propdestroy: %s broadcasting DESTROY key='%ls' eid=%u frozen=%d static=%d",
+            roleStr, keyless ? L"None" : keyStr.c_str(), dp.elementId,
+            ue_wrap::prop::IsFrozen(self) ? 1 : 0, ue_wrap::prop::IsStatic(self) ? 1 : 0);
     // If this prop is dying inside the coin gun's verb bracket, the sale is authored first, on
     // this same lane, so FIFO delivers it while the host's copy is still alive, which the mint
     // requires: the sale positions its coins from the sold prop's component. After every gate

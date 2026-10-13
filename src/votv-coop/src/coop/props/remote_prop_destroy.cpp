@@ -90,6 +90,9 @@ void DestroyResolvedLocalActor_(void* actor, const std::wstring& keyW,
     }
     UE_LOGI("remote_prop::OnDestroy: key '%ls' eid=%u -> destroying local actor %p",
             keyW.c_str(), payload.elementId, actor);
+    UE_LOGI("propdestroy: destroying local actor %p key='%ls' eid=%u (incoming destroy, "
+            "echo-suppressed -- our own destroy seam will not rebroadcast)",
+            actor, keyW.c_str(), payload.elementId);
     if (ue_wrap::prop::IsChipPile(actor) || ue_wrap::prop::IsGarbageClump(actor)) {
         UE_LOGI("[PILE] CLIENT destroy eid=%u -> mirror %p removed (the pile/clump vanished here too, "
                 "matching the host)", payload.elementId, actor);
@@ -133,6 +136,8 @@ bool OnDestroyImpl_(const coop::net::PropDestroyPayload& payload, void* localPla
         return true;
     }
     const std::wstring keyW = KeyToWString(payload.key);
+    UE_LOGI("propdestroy: recv DESTROY senderSlot=%d key='%ls' eid=%u", senderSlot, keyW.c_str(),
+            payload.elementId);
     // Resolve the doomed actor before draining the mirror, and eid first: the eid rides the wire
     // exactly, so identity survives key divergence, and a mirror bound under a synthetic row key
     // (the ghost-adopt path) carries a local random actor key the sender's key can never match;
@@ -157,6 +162,9 @@ bool OnDestroyImpl_(const coop::net::PropDestroyPayload& payload, void* localPla
             UE_LOGI("remote_prop::OnDestroy: key '%ls' eid=%u -- ECHO of a destroy this host already "
                     "performed as the arbiter; nothing to resolve, no scan paid",
                     keyW.c_str(), payload.elementId);
+            UE_LOGI("propdestroy: key='%ls' arbiter-echo (host already destroyed it as the authority) "
+                    "-- dropped, no-op",
+                    keyW.c_str());
             return false;
         }
         actor = coop::prop_element_tracker::ResolveLiveActorByKey(keyW);
@@ -183,6 +191,9 @@ bool OnDestroyImpl_(const coop::net::PropDestroyPayload& payload, void* localPla
                 UE_LOGI("remote_prop::OnDestroy: key '%ls' eid=%u no local actor in STEADY state (load tail "
                         "quiesced) -- no-op drop (nothing to destroy; not a before-load race; no perpetual defer)",
                         keyW.c_str(), payload.elementId);
+                UE_LOGI("propdestroy: key='%ls' eid=%u no local actor, steady state -- idempotent "
+                        "no-op drop (a second destroy for an already-destroyed key lands here)",
+                        keyW.c_str(), payload.elementId);
                 return false;
             }
             // Pre-quiescence, a genuine before-load race: hand the destroy to the drain-edge order
@@ -191,6 +202,10 @@ bool OnDestroyImpl_(const coop::net::PropDestroyPayload& payload, void* localPla
             // never loads.
             UE_LOGI("remote_prop::OnDestroy: key '%ls' eid=%u has no local actor YET -- DEFERRING to the "
                     "quiescence drain-edge (destroy-before-load; the order owner applies it post-bind)",
+                    keyW.c_str(), payload.elementId);
+            UE_LOGI("propdestroy: key='%ls' eid=%u no local actor YET -- deferred to the quiescence "
+                    "drain-edge (destroy-before-load); if the panel later appears twice, this deferral "
+                    "vs the load is the suspect",
                     keyW.c_str(), payload.elementId);
             coop::element::quiescence_drain::ArmPendingDestroy(payload);
         } else {
@@ -222,6 +237,9 @@ void AddDestroyListener(DestroyHeardFn fn) {
 // false keeps it queued. Never re-arms.
 bool TryApplyDestroy(const coop::net::PropDestroyPayload& payload) {
     void* localPlayer = coop::players::Registry::Get().Local();
+    UE_LOGI("propdestroy: deferred re-apply firing for key='%ls' eid=%u (quiescence drain-edge; "
+            "senderSlot=-1 below marks this path)",
+            KeyToWString(payload.key).c_str(), payload.elementId);
     return OnDestroyImpl_(payload, localPlayer, /*senderSlot=*/-1, /*allowDefer=*/false);
 }
 

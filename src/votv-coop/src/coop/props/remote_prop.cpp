@@ -667,6 +667,9 @@ void ClearAnyDriveFor(void* actor) {
         if (d.actor == actor) {
             UE_LOGI("remote_prop: actor %p was under active kinematic drive (slot %td) -- clearing drive cache",
                     actor, std::distance(&g_drives[0], &d));
+            UE_LOGI("propdestroy: kinematic drive cleared for actor %p (slot %td) during destroy "
+                    "teardown (also fires on disconnect teardown)",
+                    actor, std::distance(&g_drives[0], &d));
             ResetDriveState(d);
         }
     }
