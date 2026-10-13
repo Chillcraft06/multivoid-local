@@ -73,5 +73,7 @@ jobs:
             -R "$REPO" \
             --notes "sha: $SHA
 
-          Rolling development build of the private Multivoid fork.
-          The in-game updater (F1 > Mod > Update) installs this."
+          Rolling development build of the Multivoid fork.
+          The in-game updater (F1 > Mod > Update) installs the mod zip.
+          install-profile.ps1 installs Multivoid-r2modman-profile.zip,
+          the complete mod-manager profile for friends."

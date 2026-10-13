@@ -213,6 +213,12 @@ docs/security/
 !assets/paks/*.png
 !assets/paks/README.md
 
+# dist/profile-skeleton is TRACKED: the one-click profile zip is assembled on a
+# fresh runner checkout, which must carry the exact official unreal_shimloader
+# bytes. The negation is scoped to this directory's two DLLs, so the global
+# `*.dll` rule above keeps covering build outputs and game binaries.
+!dist/profile-skeleton/*.dll
+
 # SUPPORT.md is the working source the public donation copy is cut from, including the cost
 # arithmetic behind the suggested amounts -- a useful number for the author that reads as a quota
 # on a public page. What ships is a subset. Note the filename is not neutral: GitHub gives a
