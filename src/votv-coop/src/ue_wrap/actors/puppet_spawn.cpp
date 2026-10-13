@@ -317,6 +317,13 @@ static void* SpawnPuppetMainPlayer(const FVector& loc,
     dumpMeshComp(L"playermodel",        ReadPtr(actor, P::off::AmainPlayer_playermodel));
     dumpMeshComp(L"ACharacter::Mesh",   ReadPtr(actor, P::off::ACharacter_Mesh));
 
+    // Puppet collision ON (QueryAndPhysics): thrown physics objects and the ATV now collide with
+    // remote players instead of passing through. The puppet is wire-driven via SetActorLocation
+    // (not physics-simulated), so it won't be pushed; it just blocks. Players bumping into each
+    // other is the point.
+    E::SetActorRootCollisionEnabled(actor, 3 /*QueryAndPhysics*/);
+    UE_LOGI("puppet[MainPlayer]: enabled root collision (QueryAndPhysics) for player-vs-player hits");
+
     return actor;
 }
 
