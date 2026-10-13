@@ -1,7 +1,8 @@
 <# .SYNOPSIS
-#   One-click installer for the Multivoid r2modman profile.
-#   Downloads the profile zip from the private GitHub release and extracts it
-#   into r2modman's profiles folder. No explorer tango required.
+#   One-click installer for the Multivoid mod-manager profile.
+#   Works with r2modman and Thunderstore Mod Manager.
+#   Downloads the profile zip from the GitHub release and extracts it
+#   into the mod manager's profiles folder. No explorer tango required.
 #
 # .USAGE
 #   Right-click > Run with PowerShell, or:  powershell -ExecutionPolicy Bypass -File install-profile.ps1
@@ -21,37 +22,45 @@ $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # ------------------------------------------------- close r2modman check ---
 $r2 = Get-Process -Name "r2modman" -ErrorAction SilentlyContinue
-if ($r2) {
+$tsmm = Get-Process -Name "Thunderstore Mod Manager" -ErrorAction SilentlyContinue
+if ($r2 -or $tsmm) {
     Write-Host ""
-    Write-Host "  r2modman is running. Close it before installing the profile," -ForegroundColor Yellow
+    Write-Host "  Your mod manager is running. Close it before installing the profile," -ForegroundColor Yellow
     Write-Host "  otherwise files may be locked and the install can fail." -ForegroundColor Yellow
     Write-Host ""
-    $ans = Read-Host "  Close r2modman now? (Y/n)"
+    $ans = Read-Host "  Close it now? (Y/n)"
     if ($ans -notmatch '^[Nn]') {
-        Stop-Process -Name "r2modman" -Force
+        if ($r2)  { Stop-Process -Name "r2modman" -Force }
+        if ($tsmm) { Stop-Process -Name "Thunderstore Mod Manager" -Force }
         Start-Sleep -Seconds 2
     }
 }
 
 # ------------------------------------------------------- locate profiles ---
 # r2modman keeps per-game data under %APPDATA%\r2modmanPlus-local\<Game>\profiles
-$base = Join-Path $env:APPDATA "r2modmanPlus-local"
-if (-not (Test-Path $base)) {
+# Thunderstore Mod Manager uses %APPDATA%\Thunderstore Mod Manager\DataFolder\<Game>\profiles
+$baseDirs = @(
+    (Join-Path $env:APPDATA "r2modmanPlus-local"),
+    (Join-Path $env:APPDATA "Thunderstore Mod Manager")
+) | Where-Object { Test-Path $_ }
+
+if (-not $baseDirs) {
     Write-Host ""
-    Write-Host "  Could not find r2modman data folder at:" -ForegroundColor Red
-    Write-Host "    $base" -ForegroundColor Red
-    Write-Host "  Is r2modman installed? Install it first, run it once, then re-run this script." -ForegroundColor Red
+    Write-Host "  Could not find r2modman or Thunderstore Mod Manager data folder." -ForegroundColor Red
+    Write-Host "  Install one of them first, run it once, then re-run this script." -ForegroundColor Red
     Read-Host "  Press Enter to exit"
     exit 1
 }
 
-$profileDirs = Get-ChildItem -Path $base -Directory -Recurse -Depth 2 |
-    Where-Object { $_.Name -eq "profiles" } |
-    Select-Object -ExpandProperty FullName
+$profileDirs = foreach ($base in $baseDirs) {
+    Get-ChildItem -Path $base -Directory -Recurse -Depth 3 |
+        Where-Object { $_.Name -eq "profiles" } |
+        Select-Object -ExpandProperty FullName
+}
 
 if (-not $profileDirs) {
     Write-Host ""
-    Write-Host "  Found r2modman but no profiles folder. Run r2modman once," -ForegroundColor Red
+    Write-Host "  Found a mod manager but no profiles folder. Run it once," -ForegroundColor Red
     Write-Host "  create/select your game, then re-run this script." -ForegroundColor Red
     Read-Host "  Press Enter to exit"
     exit 1
@@ -61,7 +70,7 @@ if ($profileDirs.Count -eq 1) {
     $ProfilesDir = $profileDirs[0]
 } else {
     Write-Host ""
-    Write-Host "  Multiple r2modman games found. Which one is Voices of the Void?" -ForegroundColor Cyan
+    Write-Host "  Which one is Voices of the Void?" -ForegroundColor Cyan
     for ($i = 0; $i -lt $profileDirs.Count; $i++) {
         Write-Host ("    [{0}] {1}" -f ($i + 1), $profileDirs[$i])
     }
@@ -98,6 +107,6 @@ Expand-Archive -Path $zipPath -DestinationPath $ProfilesDir -Force
 Remove-Item $zipPath -Force
 
 Write-Host ""
-Write-Host "  Done! Open r2modman and select the '$ProfileName' profile." -ForegroundColor Green
+Write-Host "  Done! Open your mod manager and select the '$ProfileName' profile." -ForegroundColor Green
 Write-Host ""
 Read-Host "  Press Enter to exit"
