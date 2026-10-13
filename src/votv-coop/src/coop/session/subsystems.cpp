@@ -121,6 +121,8 @@
 #include "coop/props/grab_observer.h"
 #include "coop/player/item_activate.h"
 #include "coop/player/player_damage.h"
+#include "coop/player/player_grab_sync.h"  // player grab/drag/throw lane
+#include "coop/props/prop_hold_sync.h"     // shared prop hold / tug-of-war lane
 #include "coop/session/player_handshake.h"  // TickSkinConverge
 #include "coop/session/worldrules_sync.h"  // host-edited world rules -> joiner
 #include "coop/furnace/furnace_sync.h"  // the furnace's door + fire state -> joiner
@@ -470,6 +472,7 @@ void DisconnectSlot(coop::net::Session& session, int slot) {
     coop::owner_entity_sync::OnPeerLeftSlot(slot);  // destroy the leaver's owner-entity mirrors (its eyer dies with it)
     coop::hook_sync::OnPeerLeftSlot(slot);  // the leaver's OWNER-PHASE hook mirrors; anchored ones are the host's and stay
     coop::player_inventory_sync::OnDisconnectForSlot(slot);  // re-arm the on-join push; the leaver's profile stays held
+    coop::prophold_sync::OnDisconnectForSlot(slot);  // drop the leaver from contested prop holds (de-contest)
 }
 
 DisconnectStats DisconnectAll() {
@@ -518,6 +521,8 @@ DisconnectStats DisconnectAll() {
     coop::coord_tower_ops::OnDisconnect();
     coop::coord_tower_rows::OnDisconnect();
     coop::atv_sync::OnDisconnect();
+    coop::playergrab_sync::OnDisconnect();  // drop the grab latch + per-session grab state
+    coop::prophold_sync::OnDisconnect();    // drop the per-key holder table
     coop::drone_sync::OnDisconnect();
     coop::order_sync::OnDisconnect();
     coop::coingun_sync::OnDisconnect();  // dump the lane summary + drop the sold-set, the barrier queue and the cached gun

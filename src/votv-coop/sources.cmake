@@ -163,6 +163,7 @@ set(VOTVCOOP_SOURCES
     src/coop/player/movement_ledger.cpp
     src/coop/player/remote_player.cpp
     src/coop/player/remote_player_ragdoll.cpp
+    src/coop/player/player_grab_sync.cpp
     src/coop/player/client_model.cpp
     src/coop/player/skin_effects.cpp
     src/coop/player/skin_registry.cpp
@@ -287,6 +288,7 @@ set(VOTVCOOP_SOURCES
     src/coop/props/prop_element_tracker.cpp
     src/coop/props/prop_key_index.cpp
     src/coop/props/prop_destroy_seam.cpp
+    src/coop/props/prop_hold_sync.cpp
     src/coop/props/prop_lifecycle.cpp
     src/coop/props/prop_container_extract.cpp
     src/coop/props/prop_food_state.cpp

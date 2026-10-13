@@ -4,6 +4,8 @@
 
 #include "coop/player/local_streams.h"
 
+#include "coop/player/player_grab_sync.h"  // player-to-player grab/drag/throw lane
+#include "coop/props/prop_hold_sync.h"     // shared prop hold / tug-of-war lane
 #include "coop/dev/perf_probe.h"
 #include "coop/element/element.h"
 #include "coop/config/config.h"
@@ -192,6 +194,8 @@ void OnSessionStart() {
     g_relEdgeLoggedEid = coop::element::kInvalidId;
     g_relEdgeLoggedSkip = -1;
     g_gapLoggedEid = coop::element::kInvalidId;
+    coop::playergrab_sync::OnSessionStart();
+    coop::prophold_sync::OnSessionStart();
 }
 
 void Tick(coop::net::Session& session, void* local, void* controller) {
@@ -396,15 +400,29 @@ void Tick(coop::net::Session& session, void* local, void* controller) {
         if (!poseRead) {
             // An unreadable held prop streams no pose this tick; its identity is kept below.
         } else if (pp.key.len > 0 || pp.elementId != 0) {
-            session.SetLocalPropPose(true, pp);
-            // The first 3 and every 60th, matching the receiver's throttle so the two logs diff
-            // line for line.
-            const uint64_t n = ++g_propEmitCount;
-            if (n <= 3 || (n % 60) == 0) {
-                UE_LOGI("net: PropPose emit #%llu -> world(%.1f, %.1f, %.1f) rot(%.1f, %.1f, %.1f) key.len=%d eid=%u ctx=%u",
-                        static_cast<unsigned long long>(n),
-                        pp.x, pp.y, pp.z, pp.pitch, pp.yaw, pp.roll,
-                        static_cast<int>(pp.key.len), pp.elementId, static_cast<unsigned>(pp.ctx));
+            // Tug-of-war: when another peer holds this prop and won the streamer election
+            // (the lowest element id streams), our pose stream for it is suppressed so the
+            // two streams do not fight over the mirrors. The hold itself -- the cache and
+            // the release edge below -- is untouched.
+            if (coop::prophold_sync::ShouldSuppressPropPose(pp.key)) {
+                static uint64_t sSuppress = 0;
+                if ((sSuppress++ % 60) == 0) {
+                    UE_LOGI("[POSE-SUPPRESS] key.len=%d eid=%u -- contested hold, another "
+                            "holder streams (suppressed #%llu)",
+                            static_cast<int>(pp.key.len), pp.elementId,
+                            static_cast<unsigned long long>(sSuppress));
+                }
+            } else {
+                session.SetLocalPropPose(true, pp);
+                // The first 3 and every 60th, matching the receiver's throttle so the two logs diff
+                // line for line.
+                const uint64_t n = ++g_propEmitCount;
+                if (n <= 3 || (n % 60) == 0) {
+                    UE_LOGI("net: PropPose emit #%llu -> world(%.1f, %.1f, %.1f) rot(%.1f, %.1f, %.1f) key.len=%d eid=%u ctx=%u",
+                            static_cast<unsigned long long>(n),
+                            pp.x, pp.y, pp.z, pp.pitch, pp.yaw, pp.roll,
+                            static_cast<int>(pp.key.len), pp.elementId, static_cast<unsigned>(pp.ctx));
+                }
             }
         } else {
             // The held clump has no identity, so the pose is not streamed; firing between grabs
@@ -585,6 +603,13 @@ void Tick(coop::net::Session& session, void* local, void* controller) {
             UE_LOGI("net: RagdollPose stream STOP (local player recovered)");
         }
     }
+
+    // Player-to-player grab/drag/throw (coop/player/player_grab_sync) and shared prop
+    // holds (coop/props/prop_hold_sync): both lanes' send-side edge detectors and the
+    // receive-side upkeep run here, on the same game-thread tick and the same
+    // connected/authoritative gate as the other outbound streams.
+    coop::playergrab_sync::Tick(session, local);
+    coop::prophold_sync::Tick(session, local);
 }
 
 }  // namespace coop::local_streams

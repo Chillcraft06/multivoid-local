@@ -10,6 +10,8 @@
 #include "coop/element/registry.h"
 
 #include "coop/player/item_activate.h"
+#include "coop/player/player_grab_sync.h"  // the player grab/drag/throw lane
+#include "coop/props/prop_hold_sync.h"     // the shared prop hold / tug-of-war lane
 #include "coop/session/join_progress.h"
 #include "coop/creatures/npc_mirror.h"
 #include "coop/creatures/owner_entity_sync.h"
@@ -820,6 +822,49 @@ bool HandleEntityEvent(net::Session& session,
         const int senderCopy = msg.senderPeerSlot;
         ue_wrap::game_thread::Post([pIntent, senderCopy] {
             ::coop::furnace_sync::OnDoorIntent(pIntent, senderCopy);
+        });
+        break;
+    }
+    case net::ReliableKind::PlayerGrabState: {
+        // Grabber-authored: a peer grabbed, is dragging, threw, or released another player's
+        // ragdoll body. The handler validates the action and the pose, drops our own relayed
+        // echo, and applies the drag on the target's client (the pose authority).
+        if (msg.payloadLen < sizeof(net::PlayerGrabPayload)) {
+            UE_LOGW("event_feed: PlayerGrabState payload too short (%zu < %zu)",
+                    static_cast<size_t>(msg.payloadLen), sizeof(net::PlayerGrabPayload));
+            break;
+        }
+        net::PlayerGrabPayload pGrab{};
+        std::memcpy(&pGrab, msg.payload, sizeof(pGrab));
+        if (!VerifySenderEidRange(msg.senderPeerSlot, pGrab.grabberElementId,
+                                  "PlayerGrabState")) {
+            break;
+        }
+        const int senderCopy = msg.senderPeerSlot;
+        ue_wrap::game_thread::Post([pGrab, senderCopy] {
+            ::coop::playergrab_sync::OnGrabState(pGrab, senderCopy);
+        });
+        break;
+    }
+    case net::ReliableKind::PropHoldState: {
+        // Holder-authored: a peer grabbed or released a world prop, or contests it with another
+        // holder (tug-of-war). The handler keeps the per-key holder table and answers contests;
+        // the lowest element id among the holders streams the pose.
+        if (msg.payloadLen < sizeof(net::PropHoldPayload)) {
+            UE_LOGW("event_feed: PropHoldState payload too short (%zu < %zu)",
+                    static_cast<size_t>(msg.payloadLen), sizeof(net::PropHoldPayload));
+            break;
+        }
+        net::PropHoldPayload pHold{};
+        std::memcpy(&pHold, msg.payload, sizeof(pHold));
+        const uint32_t senderEid =
+            pHold.holderCount > 0 ? pHold.holderElementId[0] : 0u;
+        if (!VerifySenderEidRange(msg.senderPeerSlot, senderEid, "PropHoldState")) {
+            break;
+        }
+        const int senderCopy = msg.senderPeerSlot;
+        ue_wrap::game_thread::Post([pHold, senderCopy] {
+            ::coop::prophold_sync::OnHoldState(pHold, senderCopy);
         });
         break;
     }
