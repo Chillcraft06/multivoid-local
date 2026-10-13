@@ -6,18 +6,31 @@
 
 #pragma once
 
+#include "coop/interactables/atv_spawner_keys.h"  // the (spawner, index) identity
 #include "ue_wrap/core/types.h"
 #include "ue_wrap/devices/atv_condition.h"
 
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 namespace coop::atv_sync {
 
 struct AtvEntry {
     void*   actor = nullptr;
     int32_t idx   = -1;
+    // ---- the per-spawner mirror identity (atv_spawner_keys.h) ----
+    // Every ATV is born from one spawner ("save", "menu", "menu@<slot>") and the map key is the
+    // composite "<spawner>#<local id>", so two peers agree on which ATV is which even when two
+    // ATVs share one save Key string.
+    std::wstring spawnerKey;   // the spawner this ATV was born from
+    std::wstring realKey;      // save spawner: the game's Key (the identity WITHIN the spawner)
+    uint32_t     spawnOrdinal = 0;  // save spawner: duplicate-Key disambiguation, by spawn-site order
+    coop::atv_spawner_keys::SpawnSite spawnSite{};  // first-sighting site (the ordinal's stable sort key)
+    bool         siteValid = false;
+    bool         keyAdopted = false;  // client: this composite key was adopted from the host's
+                                      // snapshot (its ordinals may differ from the local rule's)
     uint64_t lastSentMs   = 0;
     uint64_t lastPktMs    = 0;     // arrival of the last correcting packet -- the corrector's dt
     uint8_t  occupantSlot = 0xFF;  // the SEATED driver's peer slot (0xFF = seat free). THE SEAT --

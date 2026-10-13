@@ -192,13 +192,14 @@ bool HandleStateEvent(net::Session& session,
         break;
     }
     case net::ReliableKind::AtvSpawn: {
-        // The host-to-client runtime-ATV announce: the client fresh-spawns a native ATV it has no
-        // save twin of (spawned at runtime from the props table; nothing sells an ATV).
-        // Host-authoritative, slot 0 only.
-        if (msg.senderPeerSlot != 0) {
-            UE_LOGW("event_feed: AtvSpawn from non-host senderPeerSlot=%d -- dropping", msg.senderPeerSlot);
-            break;
-        }
+        // The runtime-ATV announce, two directions on one kind:
+        //  - host -> client (senderPeerSlot 0): the host's menu-spawned ATV, or a client's
+        //    menu@slot ATV the host adopted and re-announced. The client fresh-spawns a native
+        //    mirror it has no save twin of.
+        //  - client -> host (senderPeerSlot != 0): the client's own spawn-menu announce. The
+        //    host validates the key names the sender's menu spawner, spawns its own mirror,
+        //    and re-announces it to the other clients. AtvSpawn is not relayed (host-authored
+        //    announce), so a client never sees another client's raw announce.
         if (msg.payloadLen < sizeof(net::AtvSpawnPayload)) {
             UE_LOGW("event_feed: AtvSpawn payload too short (%zu < %zu)",
                     static_cast<size_t>(msg.payloadLen), sizeof(net::AtvSpawnPayload));
@@ -206,15 +207,21 @@ bool HandleStateEvent(net::Session& session,
         }
         net::AtvSpawnPayload asp{};
         std::memcpy(&asp, msg.payload, sizeof(asp));
-        coop::atv_sync::OnAtvSpawn(asp, 0);
+        if (msg.senderPeerSlot == 0) {
+            coop::atv_sync::OnAtvSpawn(asp, 0);
+        } else {
+            const uint8_t senderSlot =
+                (msg.senderPeerSlot >= 0 && msg.senderPeerSlot < net::kMaxPeers)
+                    ? static_cast<uint8_t>(msg.senderPeerSlot)
+                    : static_cast<uint8_t>(0xFF);
+            coop::atv_sync::OnClientAtvSpawn(asp, senderSlot);
+        }
         break;
     }
     case net::ReliableKind::AtvDestroy: {
-        // The host-to-client runtime-ATV teardown. Host-authoritative, slot 0 only.
-        if (msg.senderPeerSlot != 0) {
-            UE_LOGW("event_feed: AtvDestroy from non-host senderPeerSlot=%d -- dropping", msg.senderPeerSlot);
-            break;
-        }
+        // The runtime-ATV teardown, same two directions as AtvSpawn: the host's teardown goes to
+        // the clients' mirrors; a client's own menu@slot teardown goes to the host, which tears
+        // down its mirror and re-announces.
         if (msg.payloadLen < sizeof(net::AtvDestroyPayload)) {
             UE_LOGW("event_feed: AtvDestroy payload too short (%zu < %zu)",
                     static_cast<size_t>(msg.payloadLen), sizeof(net::AtvDestroyPayload));
@@ -222,7 +229,15 @@ bool HandleStateEvent(net::Session& session,
         }
         net::AtvDestroyPayload adp{};
         std::memcpy(&adp, msg.payload, sizeof(adp));
-        coop::atv_sync::OnAtvDestroy(adp, 0);
+        if (msg.senderPeerSlot == 0) {
+            coop::atv_sync::OnAtvDestroy(adp, 0);
+        } else {
+            const uint8_t senderSlot =
+                (msg.senderPeerSlot >= 0 && msg.senderPeerSlot < net::kMaxPeers)
+                    ? static_cast<uint8_t>(msg.senderPeerSlot)
+                    : static_cast<uint8_t>(0xFF);
+            coop::atv_sync::OnClientAtvDestroy(adp, senderSlot);
+        }
         break;
     }
     case net::ReliableKind::DroneState: {

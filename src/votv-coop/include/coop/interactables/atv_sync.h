@@ -27,10 +27,13 @@ namespace coop::atv_sync {
 // Resolve AATV_C + build the key->actor index; store the session pointer. Idempotent; retried
 // every net-pump tick until the class loads. Game thread.
 //
-// Identity is the save-placed Key, which is stable across peers -- a keyed pose stream, not the
-// eid/Element/spawn machinery (YAGNI for one always-present keyed actor; the grime and window-dirt
-// syncs made the same call). An ATV that appears at RUNTIME has no save-twin and no stable key, so
-// the host mints a synthetic one and announces it (AtvSpawn/AtvDestroy).
+// Identity is (spawner, spawn index): "save#<key>" for save-placed ATVs -- the save-placed Key
+// is stable across peers, so this stays a keyed pose stream, not the eid/Element/spawn machinery
+// (the grime and window-dirt syncs made the same call) -- "save#<key>#<n>" when two ATVs share one
+// Key string (ordered by spawn site), "menu#<n>" for the host's spawn-menu spawner,
+// "menu@<slot>#<n>" for a client's (see coop/interactables/atv_spawner_keys.h). An ATV that
+// appears at RUNTIME has no save-twin, so the host mints the menu key and announces it
+// (AtvSpawn/AtvDestroy).
 void Install(coop::net::Session* session);
 
 // Receiver entry: an AtvState packet arrived (payload already memcpy'd + range-checked by
@@ -49,14 +52,26 @@ void OnAtvRelease(const coop::net::AtvReleasePayload& payload, uint8_t senderPee
 // Receiver entry (CLIENT-only): an AtvSpawn arrived. The host announces a RUNTIME-spawned ATV the
 // client has no save-twin of (the spawn menu's 'atv' row; it is not purchasable and nothing sells
 // one). Fresh-spawns a native AATV_C (ue_wrap::atv::SpawnMirror, physics ON = grabbable) at the
-// host pose and registers it under the host's synthetic wire key, so the existing
-// AtvState/AtvRelease key-stream drives it. Idempotent on the synthetic key (re-announce / connect
+// host pose and registers it under the host's menu-spawner key, so the existing
+// AtvState/AtvRelease key-stream drives it. Idempotent on the menu key (re-announce / connect
 // dup -> no-op). From event_feed.
 void OnAtvSpawn(const coop::net::AtvSpawnPayload& payload, uint8_t senderPeerSlot);
 
 // Receiver entry (CLIENT-only): an AtvDestroy arrived. The host's synthetic-keyed (runtime) ATV is
 // gone -> K2_DestroyActor the fresh-spawned mirror + drop the index entry. From event_feed.
 void OnAtvDestroy(const coop::net::AtvDestroyPayload& payload, uint8_t senderPeerSlot);
+
+// Receiver entry (HOST-only): a client's spawn-menu announce arrived (AtvSpawn from a non-host
+// sender). The key must be "menu@<slot>#<n>" with the slot matching the sender; the host
+// fresh-spawns its own native mirror under that key, indexes it under the client's menu spawner,
+// and re-announces it so the other clients mirror it too. Idempotent. From event_feed.
+void OnClientAtvSpawn(const coop::net::AtvSpawnPayload& payload, uint8_t senderPeerSlot);
+
+// Receiver entry (HOST-only): a client's spawn-menu teardown arrived (AtvDestroy from a non-host
+// sender). The key must be "menu@<slot>#<n>" with the slot matching the sender; the host destroys
+// its mirror, drops the entry, and re-announces the destroy so the other clients tear down their
+// mirrors. From event_feed.
+void OnClientAtvDestroy(const coop::net::AtvDestroyPayload& payload, uint8_t senderPeerSlot);
 
 // HOST-only: snapshot every indexed ATV's pose, VELOCITY and holder to a freshly connected client
 // `peerSlot` (adopt=1 -> the joiner warps to it). Carrying the velocity is what lets an ATV that is

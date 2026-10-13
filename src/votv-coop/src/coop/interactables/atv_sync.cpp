@@ -9,15 +9,18 @@
 // since their vehicle is one rigid body. Two predicates: IsPoseAuthor (I drive or carry it) and
 // OwnsTick (that, or I am the host and nobody authors it); the seat (occupantSlot, which the
 // mount deny reads) and the author (authorSlot, who streams) stay separate, since a grabbing
-// peer must not deny the seat. Keyed by the save key. The seat is self-elected, and two peers
-// mounting inside one round-trip both elect themselves: the lower slot wins in OnReliable, a
-// tie-break, not authority.
+// peer must not deny the seat. Keyed by (spawner, spawn index): "save#<key>" for save-placed
+// ATVs ("save#<key>#<n>" when two share one Key string, ordered by spawn site), "menu#<n>" for
+// the host's spawn-menu spawner, "menu@<slot>#<n>" for a client's (see atv_spawner_keys.h). The
+// seat is self-elected, and two peers mounting inside one round-trip both elect themselves:
+// the lower slot wins in OnReliable, a tie-break, not authority.
 
 #include "coop/interactables/atv_sync.h"
 #include "coop/interactables/atv_corrector.h"
 #include "coop/dev/atv_eject_drill.h"
 #include "coop/interactables/atv_condition_sync.h"
 #include "coop/interactables/atv_hit_guard.h"
+#include "coop/interactables/atv_spawner_keys.h"
 #include "coop/interactables/atv_sync_internal.h"
 
 #include "coop/net/protocol.h"
@@ -38,6 +41,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -49,6 +53,7 @@ namespace {
 
 namespace R = ue_wrap::reflection;
 namespace A = ue_wrap::atv;
+namespace SK = coop::atv_spawner_keys;
 using ue_wrap::FVector;
 using ue_wrap::FRotator;
 using coop::net::WireKeyFromString;
@@ -83,20 +88,121 @@ size_t   g_lastLogCount = SIZE_MAX;
 uint64_t g_lastLogHash  = 0;
 bool     g_installed    = false;  // latches the one-time index; Install is the per-tick ensure path
 
-// Runtime-spawned ATV identity. Nothing sells an ATV, but list_props row 'atv' spawns an ATV_C
-// from the spawn menu; such an ATV has no save twin on the other peers and its own save key is
-// minted randomly per peer, so the host gives it a synthetic wire key ("coopatv#N") and announces
-// it, and clients fresh-spawn a native AATV_C under that key. A save-placed ATV (a deterministic
-// key both peers loaded) keeps its real key.
-std::unordered_set<std::wstring>        g_savePlacedKeys;    // host: real keys seen before any client connected, so save-placed
+// Per-spawner mirror identity (see coop/interactables/atv_spawner_keys.h). Every ATV is born
+// from one spawner -- "save" (the world/save loader), "menu" (the host's spawn-menu spawner),
+// "menu@<slot>" (a client's spawn-menu spawner) -- and the g_atvs key is the composite
+// "<spawner>#<local id>", so two peers looking at ATVs from different spawners agree on which
+// ATV is which. A save-placed ATV keeps its deterministic Key inside the save spawner's local
+// id ("save#<key>"); two ATVs sharing one Key string get ordinals by spawn-site order
+// ("save#<key>#<n>"). Nothing sells an ATV, but list_props row 'atv' spawns an ATV_C from the
+// spawn menu at runtime; such an ATV has no save twin on the other peers and its own save key
+// is minted randomly per peer, so the host mints "menu#N" and announces it, and clients
+// fresh-spawn a native AATV_C under that key.
+std::unordered_set<std::wstring>        g_savePlacedKeys;    // real keys known save-placed (host: seen before any client connected; client: seen before the connect snapshot)
 std::unordered_set<void*>               g_savePlacedActors;  // host: the actors present before any client, so a save ATV that mints its key late is not misread as a runtime spawn
-std::unordered_map<void*, std::wstring> g_synthForActor;     // actor -> synthetic wire key (host runtime-spawned + client mirror)
-uint32_t                                g_synthCounter = 0;  // host: the monotonic synthetic-key id
+std::unordered_map<void*, std::wstring> g_keyForActor;       // actor -> composite key (menu-spawned ATVs: host runtime + client mirrors)
+uint32_t                                g_menuCounter = 0;   // host: the monotonic menu-spawner id
+uint32_t                                g_clientMenuCounter = 0;  // client: the local menu@slot spawner id
+bool                                    g_clientSawSnapshot = false;  // client: the host's connect snapshot arrived; ATVs appearing later are menu spawns
 
-const wchar_t* const kSynthPrefix = L"coopatv#";  // distinguishes synth keys from real ATV keys ("atv"/base64)
+// Save spawner: realKey -> sorted spawn sites. The duplicate-Key ordinal source; the sorted
+// insert is order-independent, which is what makes the ordinals peer-deterministic (both peers
+// loaded the same save bytes, so both compute identical sites).
+std::map<std::wstring, std::vector<SK::SpawnSite>> g_saveSites;
 
-bool IsSynthKey(const std::wstring& k) {
-    return k.compare(0, 8, kSynthPrefix) == 0;  // "coopatv#" is 8 chars
+// The per-spawner mirror table: spawner key -> composite keys of its live ATV mirrors. The
+// mirror state itself (actor/transform, occupantSlot, authorSlot) lives in the g_atvs entries;
+// rebuilt after every structural change.
+std::unordered_map<std::wstring, std::vector<std::wstring>> g_bySpawner;
+
+void RebuildSpawnerIndex() {
+    g_bySpawner.clear();
+    for (const auto& kv : g_atvs) {
+        if (!kv.second.spawnerKey.empty())
+            g_bySpawner[kv.second.spawnerKey].push_back(kv.first);
+    }
+}
+
+// Client-side snapshot adoption: host composite keys seen in AtvState but not yet bound to a
+// local actor. The snapshot can beat the hub pass, and the host's duplicate-key ordinals can
+// differ from the local rule's (anchors are captured at world load on the host but at join time
+// on the client, so mid-session movement can flip the site order). Retried on every hub pass;
+// the bind is by realKey + proximity, never by ordinal.
+struct PendingAdopt {
+    std::wstring compositeKey;
+    std::wstring realKey;
+    FVector      pos;  // the snapshot pose: the local twin is the same rig, so it is close
+};
+std::vector<PendingAdopt> g_pendingAdopts;
+constexpr size_t kMaxPendingAdopts = 64;
+constexpr float  kAdoptBindCm = 500.0f;  // a snapshot binds the local ATV within this distance
+
+// The g_atvs entry for this actor, or g_atvs.end(). N is a handful of ATVs; a linear scan is fine.
+std::unordered_map<std::wstring, AtvEntry>::iterator FindByActor(void* obj) {
+    for (auto it = g_atvs.begin(); it != g_atvs.end(); ++it)
+        if (it->second.actor == obj) return it;
+    return g_atvs.end();
+}
+
+float Dist2(const FVector& a, float x, float y, float z) {
+    const float dx = a.X - x, dy = a.Y - y, dz = a.Z - z;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+// Bind a host composite key to a local actor (client snapshot adoption). The local entry is
+// re-keyed to the host's key with all its fields preserved; the entry is marked adopted so the
+// hub pass does not re-key it back to the local rule's ordinal. True on bind.
+bool AdoptKeyToActor(const std::wstring& compositeKey, const std::wstring& realKey, void* actor,
+                     float distCm) {
+    auto it = FindByActor(actor);
+    if (it == g_atvs.end()) return false;
+    if (it->first == compositeKey) return true;  // already there
+    UE_LOGI("atv: mirror adopted -- host key='%ls' bound to local actor=%p (realKey='%ls', "
+            "dist=%.0f cm; was '%ls')",
+            compositeKey.c_str(), actor, realKey.c_str(), static_cast<double>(distCm),
+            it->first.c_str());
+    AtvEntry e = std::move(it->second);
+    const auto kf = g_keyForActor.find(actor);
+    g_atvs.erase(it);
+    e.keyAdopted = true;
+    e.spawnerKey = SK::kSaveSpawner;
+    e.realKey = realKey;
+    g_atvs[compositeKey] = std::move(e);
+    if (kf != g_keyForActor.end()) kf->second = compositeKey;
+    RebuildSpawnerIndex();
+    return true;
+}
+
+void StashPendingAdopt(const std::wstring& compositeKey, const std::wstring& realKey,
+                       const FVector& pos) {
+    for (const auto& p : g_pendingAdopts)
+        if (p.compositeKey == compositeKey) return;  // already waiting
+    if (g_pendingAdopts.size() >= kMaxPendingAdopts)
+        g_pendingAdopts.erase(g_pendingAdopts.begin());  // FIFO: the oldest never bound
+    g_pendingAdopts.push_back({ compositeKey, realKey, pos });
+}
+
+// Try to bind one pending host key to a freshly indexed local actor.
+void DrainPendingAdopts() {
+    if (g_pendingAdopts.empty()) return;
+    for (auto pi = g_pendingAdopts.begin(); pi != g_pendingAdopts.end();) {
+        void* bindActor = nullptr;
+        float bindDist = 0.f;
+        for (auto& kv : g_atvs) {
+            AtvEntry& e = kv.second;
+            if (e.spawnerKey != SK::kSaveSpawner || e.realKey != pi->realKey) continue;
+            if (e.keyAdopted) continue;  // already bound to a (possibly different) host key
+            if (!R::IsLiveByIndex(e.actor, e.idx)) continue;
+            FVector loc; FRotator rot;
+            if (!A::GetRootTransform(e.actor, loc, rot)) continue;
+            const float d2 = Dist2(loc, pi->pos.X, pi->pos.Y, pi->pos.Z);
+            if (d2 <= kAdoptBindCm * kAdoptBindCm) { bindActor = e.actor; bindDist = std::sqrt(d2); break; }
+        }
+        const bool bound = bindActor != nullptr &&
+                           AdoptKeyToActor(pi->compositeKey, pi->realKey, bindActor, bindDist);
+        if (bound) pi = g_pendingAdopts.erase(pi);
+        else ++pi;
+    }
 }
 
 // A WireClassName from a wide class name (ASCII), truncated at 63.
@@ -113,9 +219,11 @@ std::wstring WireClassNameToString(const coop::net::WireClassName& in) {
     return s;
 }
 
-// Host: announces a runtime ATV so clients fresh-spawn a native mirror; slot < 0 broadcasts (a
-// new ATV mid-session), slot >= 0 seeds one joiner. Reads the class and the current pose.
-void SendAtvSpawn(const std::wstring& synthKey, void* actor, int slot) {
+// Announces a runtime ATV so the other side fresh-spawns a native mirror; slot < 0 broadcasts (a
+// new ATV mid-session), slot >= 0 seeds one joiner. Reads the class and the current pose. The
+// host uses it for its menu spawner; a client uses it for the host-directed announce of its own
+// menu@slot spawn (a client has only the host connection, so slot < 0 reaches the host).
+void SendAtvSpawn(const std::wstring& menuKey, void* actor, int slot) {
     auto* s = g_session.load(std::memory_order_acquire);
     if (!s || !s->connected() || !actor) return;
     void* cls = R::ClassOf(actor);
@@ -123,7 +231,7 @@ void SendAtvSpawn(const std::wstring& synthKey, void* actor, int slot) {
     FVector loc; FRotator rot;
     if (!A::GetRootTransform(actor, loc, rot)) return;
     coop::net::AtvSpawnPayload p{};
-    WireKeyFromString(synthKey, p.synthKey);
+    WireKeyFromString(menuKey, p.synthKey);
     FillWireClassName(p.className, R::ToString(R::NameOf(cls)));
     p.x = loc.X; p.y = loc.Y; p.z = loc.Z;
     p.pitch = rot.Pitch; p.yaw = rot.Yaw; p.roll = rot.Roll;
@@ -131,11 +239,11 @@ void SendAtvSpawn(const std::wstring& synthKey, void* actor, int slot) {
     else          s->SendReliableToSlot(slot, coop::net::ReliableKind::AtvSpawn, &p, sizeof(p));
 }
 
-void SendAtvDestroy(const std::wstring& synthKey) {
+void SendAtvDestroy(const std::wstring& menuKey) {
     auto* s = g_session.load(std::memory_order_acquire);
     if (!s || !s->connected()) return;
     coop::net::AtvDestroyPayload p{};
-    WireKeyFromString(synthKey, p.synthKey);
+    WireKeyFromString(menuKey, p.synthKey);
     s->SendReliable(coop::net::ReliableKind::AtvDestroy, &p, sizeof(p));
 }
 
@@ -234,12 +342,22 @@ bool IdleWorthSending(AtvEntry& e) {
 
 // The scan-hub consumer: the hub's shared sliced pass drives these callbacks, preserving the
 // sender state for keys that persist (only the actor and index update) and classifying identity
-// as above (a save-placed ATV keeps its real key; a host-side runtime ATV gets a synthetic key
-// and an announce). A spawn landing inside the pass window at a join is announced on the next
-// pass, when the joiner is connected.
+// by spawner (save-placed ATVs keep their Key inside the save spawner's local id; a host-side
+// menu-spawned ATV gets a menu key and an announce). A spawn landing inside the pass window at
+// a join is announced on the next pass, when the joiner is connected.
 uint32_t g_indexGen = 0;  // world gen of the last completed pass (stale-gen index = EMPTY)
 bool IndexCurrent() { return g_indexGen == ue_wrap::world_identity::Generation(); }
-struct ScanFound { std::wstring wireKey; void* obj; int32_t idx; std::wstring realKey; };
+struct ScanFound {
+    void*        obj;
+    int32_t      idx;
+    std::wstring spawnerKey;    // "save" | "menu" | "menu@<slot>"
+    std::wstring realKey;       // save spawner: the game's Key (the identity WITHIN the spawner)
+    SK::SpawnSite site;         // save spawner: first-sighting site (reused from the entry when known)
+    bool         siteValid = false;
+    uint32_t     ordinal = 0;   // save spawner: duplicate-Key disambiguation (assigned in Complete)
+    std::wstring compositeKey;  // menu spawners: final here; save spawner: assigned in Complete
+    bool         isNewSpawn = false;  // first classification this session (the spawn log line)
+};
 std::vector<ScanFound> g_scanFound;   // pass scratch (GT-only)
 bool g_scanIsHost = false;            // pass context, captured at pass begin
 bool g_scanCapturing = false;
@@ -264,58 +382,203 @@ void HubMatch(void*, void* obj) {
         if (nm.rfind(L"Default__", 0) == 0) return;  // skip CDO
         if (!R::IsLive(obj)) return;
         if (capturing) g_savePlacedActors.insert(obj);  // capture the ACTOR (even before it mints its key)
-        std::wstring realKey = A::GetKeyString(obj);
-        if (realKey.empty() || realKey == L"None") return;  // not yet keyed -- the next pass picks it up
-        std::wstring wireKey;
-        auto sf = g_synthForActor.find(obj);
-        if (sf != g_synthForActor.end()) {
-            wireKey = sf->second;                              // already synth (host runtime-spawn / client mirror)
-        } else if (capturing) {
-            g_savePlacedKeys.insert(realKey);                 // baseline: a save-placed ATV
-            wireKey = realKey;
-        } else if (isHost && g_savePlacedKeys.find(realKey) == g_savePlacedKeys.end() &&
-                   g_savePlacedActors.find(obj) == g_savePlacedActors.end()) {
-            // Host: a mid-session ATV not in the save set is a runtime spawn: a synthetic wire key
-            // and an announce, so the clients fresh-spawn a mirror.
-            wireKey = std::wstring(kSynthPrefix) + std::to_wstring(++g_synthCounter);
-            g_synthForActor[obj] = wireKey;
-            SendAtvSpawn(wireKey, obj, /*slot*/ -1);          // broadcast to all connected clients
-            UE_LOGI("atv: runtime-spawned ATV detected -- synthKey='%ls' class='%ls' (host-announced AtvSpawn)",
-                    wireKey.c_str(), R::ToString(R::NameOf(R::ClassOf(obj))).c_str());
-        } else {
-            wireKey = realKey;                                 // save-placed default ATV (both peers have it)
+        // A menu-spawned ATV the hub has already keyed keeps its composite key (a host runtime
+        // spawn, or this client's mirror of one announced via AtvSpawn).
+        const auto kf = g_keyForActor.find(obj);
+        if (kf != g_keyForActor.end()) {
+            std::wstring spawner, local;
+            SK::SplitCompositeKey(kf->second, spawner, local);
+            found.push_back(ScanFound{ obj, R::InternalIndexOf(obj), std::move(spawner),
+                                       std::wstring(), SK::SpawnSite(), false, 0, kf->second,
+                                       false });
+            return;
         }
-        found.push_back({ std::move(wireKey), obj, R::InternalIndexOf(obj), std::move(realKey) });
+        // An already-indexed ATV keeps its spawner and its first-sighting site; the save
+        // spawner's composite is recomputed in Complete from the stable site, and an adopted
+        // entry keeps the host's key.
+        const auto ei = FindByActor(obj);
+        std::wstring spawnerKey;
+        std::wstring realKey;
+        SK::SpawnSite site;
+        bool siteValid = false;
+        bool isNew = false;
+        if (ei != g_atvs.end() && !ei->second.spawnerKey.empty()) {
+            spawnerKey = ei->second.spawnerKey;
+            realKey    = ei->second.realKey;
+            site       = ei->second.spawnSite;
+            siteValid  = ei->second.siteValid;
+        } else {
+            realKey = A::GetKeyString(obj);
+            if (realKey.empty() || realKey == L"None") return;  // not yet keyed -- the next pass picks it up
+            isNew = true;
+            if (capturing) {
+                g_savePlacedKeys.insert(realKey);              // baseline: a save-placed ATV
+                spawnerKey = SK::kSaveSpawner;
+            } else if (isHost && g_savePlacedKeys.find(realKey) == g_savePlacedKeys.end() &&
+                       g_savePlacedActors.find(obj) == g_savePlacedActors.end()) {
+                // Host: a mid-session ATV not in the save set is a spawn-menu spawn: a
+                // menu-spawner key and an announce, so the clients fresh-spawn a mirror.
+                spawnerKey = SK::kHostMenuSpawner;
+                const std::wstring compositeKey =
+                    SK::BuildCompositeKey(spawnerKey, std::to_wstring(++g_menuCounter));
+                g_keyForActor[obj] = compositeKey;
+                SendAtvSpawn(compositeKey, obj, /*slot*/ -1);  // broadcast to all connected clients
+                UE_LOGI("atv: spawner keyed -- key='%ls' spawner='menu' class='%ls' (host-announced AtvSpawn)",
+                        compositeKey.c_str(), R::ToString(R::NameOf(R::ClassOf(obj))).c_str());
+                found.push_back(ScanFound{ obj, R::InternalIndexOf(obj), std::move(spawnerKey),
+                                           std::wstring(), SK::SpawnSite(), false, 0,
+                                           compositeKey, true });
+                return;
+            } else if (!isHost && g_clientSawSnapshot &&
+                       g_savePlacedKeys.find(realKey) == g_savePlacedKeys.end()) {
+                // Client: an ATV appearing after the connect snapshot did not come from the
+                // transferred save, so it is this client's own spawn-menu spawn. It gets a
+                // stable menu@slot identity, streams under it, and announces the spawn to the
+                // host (AtvSpawn, client-originated); the host mirrors it and re-announces it
+                // so the other clients spawn mirrors too.
+                const uint8_t localSlot = coop::players::Registry::Get().LocalPeerId();
+                spawnerKey = SK::ClientMenuSpawnerForSlot(localSlot);
+                const std::wstring compositeKey =
+                    SK::BuildCompositeKey(spawnerKey, std::to_wstring(++g_clientMenuCounter));
+                g_keyForActor[obj] = compositeKey;
+                UE_LOGI("atv: spawner keyed -- key='%ls' spawner='%ls' class='%ls' (client menu spawn; announcing to host)",
+                        compositeKey.c_str(), spawnerKey.c_str(),
+                        R::ToString(R::NameOf(R::ClassOf(obj))).c_str());
+                SendAtvSpawn(compositeKey, obj, /*slot*/ -1);  // client -> host (only connection)
+                found.push_back(ScanFound{ obj, R::InternalIndexOf(obj), std::move(spawnerKey),
+                                           std::wstring(), SK::SpawnSite(), false, 0,
+                                           compositeKey, true });
+                return;
+            } else {
+                // Save-placed: the host's baseline window, or the client's pre-snapshot world
+                // (everything the transferred save materialised, keyed or still keyless).
+                if (!isHost && !g_clientSawSnapshot) g_savePlacedKeys.insert(realKey);
+                spawnerKey = SK::kSaveSpawner;
+            }
+            if (spawnerKey == SK::kSaveSpawner) {
+                FVector loc; FRotator rot;
+                if (A::GetRootTransform(obj, loc, rot)) {
+                    site = SK::QuantizeSite(loc);  // the first-sighting site; never moves after
+                    siteValid = true;
+                }
+            }
+            if (isNew && spawnerKey == SK::kSaveSpawner)
+                UE_LOGI("atv: spawner keyed -- realKey='%ls' spawner='save' actor=%p site=(%d,%d,%d)m",
+                        realKey.c_str(), obj, site.x, site.y, site.z);
+        }
+        found.push_back(ScanFound{ obj, R::InternalIndexOf(obj), std::move(spawnerKey),
+                                   std::move(realKey), site, siteValid, 0, std::wstring(), isNew });
     }
 }
 
 size_t HubPassComplete(void*, bool isFull, uint32_t worldGen) {
     const bool isHost = g_scanIsHost;
     auto& found = g_scanFound;
-    // Entries whose ATV vanished are dropped; a gone host-synthetic ATV sends AtvDestroy so the
-    // clients tear down their mirror. On a full pass `found` is authoritative; on a tail pass it is
-    // only the new tail, so liveness by index prunes instead.
+    // Save-spawner ordinals. The site insert is order-independent, so a tail pass (which sees
+    // only new arrivals) assigns the same ordinals as a full pass. An adopted entry keeps the
+    // host's key instead of the local rule's; a site-less ATV (its transform was unreadable at
+    // first sighting) falls back to the bare save key rather than dropping out of the index.
+    for (auto& f : found) {
+        if (f.spawnerKey != SK::kSaveSpawner) continue;
+        if (!f.compositeKey.empty()) continue;  // menu path or an already-final key
+        const auto ei = FindByActor(f.obj);
+        if (ei != g_atvs.end() && ei->second.keyAdopted) {
+            f.compositeKey = ei->first;  // the host's key stands; the local ordinal is not recomputed
+            f.ordinal = ei->second.spawnOrdinal;
+            continue;
+        }
+        if (!f.siteValid) {
+            if (f.isNewSpawn)
+                UE_LOGW("atv: no spawn site for realKey='%ls' actor=%p -- ordinal defaults to 0",
+                        f.realKey.c_str(), f.obj);
+            f.compositeKey = SK::BuildCompositeKey(SK::kSaveSpawner, f.realKey);
+            continue;
+        }
+        f.ordinal = SK::InsertSiteOrdinal(g_saveSites[f.realKey], f.site);
+        const std::wstring local = f.ordinal == 0
+            ? f.realKey
+            : f.realKey + L"#" + std::to_wstring(f.ordinal);
+        if (4 + 1 + local.size() > 31)  // "save#" is 5 chars; BuildCompositeKey falls back past 31
+            UE_LOGW("atv: composite key for save key '%ls' exceeded 31 chars -- deterministic FNV tag used",
+                    f.realKey.c_str());
+        f.compositeKey = SK::BuildCompositeKey(SK::kSaveSpawner, local);
+    }
+    // Defensive: a found ATV must never carry an empty key into the prune/add loops (an empty
+    // key would prune a live entry on a full pass, or create an unkeyed one).
+    for (auto& f : found) {
+        if (!f.compositeKey.empty()) continue;
+        const auto ei = FindByActor(f.obj);
+        if (ei != g_atvs.end()) f.compositeKey = ei->first;
+        else UE_LOGW("atv: found ATV actor=%p has no composite key -- skipping this pass", f.obj);
+    }
+    // Entries whose ATV vanished are dropped; a gone host menu-spawned ATV sends AtvDestroy so
+    // the clients tear down their mirror. On a full pass `found` is authoritative; on a tail pass
+    // it is only the new tail, so liveness by index prunes instead.
     for (auto it = g_atvs.begin(); it != g_atvs.end();) {
         bool keep;
         if (isFull) {
             keep = false;
-            for (auto& f : found) if (f.wireKey == it->first) { keep = true; break; }
+            for (auto& f : found) if (!f.compositeKey.empty() && f.compositeKey == it->first) { keep = true; break; }
         } else {
             keep = R::IsLiveByIndex(it->second.actor, it->second.idx);
         }
         if (keep) { ++it; continue; }
-        if (IsSynthKey(it->first)) {
-            if (isHost) SendAtvDestroy(it->first);
-            if (it->second.actor) g_synthForActor.erase(it->second.actor);
+        UE_LOGI("atv: ATV destroyed -- key='%ls' spawner='%ls' (entry dropped)",
+                it->first.c_str(), it->second.spawnerKey.c_str());
+        if (SK::IsMenuSpawnerKey(it->first)) {
+            // Menu spawn teardown: the host tells the clients (its own spawner); a client tells
+            // the host, but only for its OWN menu@slot spawner (the host authors its menu
+            // spawner, and the host re-announces an adopted client spawn to the other clients).
+            // Either way the actor->key map must not outlive the actor: a reused actor pointer
+            // would otherwise inherit a dead composite key on the next pass.
+            if (isHost && SK::IsHostMenuKey(it->first)) {
+                SendAtvDestroy(it->first);
+            } else if (!isHost) {
+                uint8_t claimedSlot = 0xFF;
+                if (SK::ParseClientMenuKey(it->first, claimedSlot) &&
+                    claimedSlot == coop::players::Registry::Get().LocalPeerId())
+                    SendAtvDestroy(it->first);  // client -> host (only connection)
+            }
+            if (it->second.actor) g_keyForActor.erase(it->second.actor);
         }
         it = g_atvs.erase(it);
     }
-    // Update or add. A wire key can outlive its actor (a save-placed key is deterministic and a
-    // client join runs two level loads), and the successor must not inherit the dead actor's
-    // authority, seat, correction clock and change-gate baseline: the entry stays, everything that
-    // described the actor resets.
+    // Update or add. A composite key can outlive its actor (a save-placed key is deterministic
+    // and a client join runs two level loads), and the successor must not inherit the dead
+    // actor's authority, seat, correction clock and change-gate baseline: the entry stays,
+    // everything that described the actor resets. A duplicate-Key ordinal shift re-keys the
+    // entry instead: the ACTOR is the same, so the seat, the author and the clocks move with it.
     for (auto& f : found) {
-        AtvEntry& e = g_atvs[f.wireKey];
+        if (f.compositeKey.empty()) continue;  // warned above; nothing to index it under
+        auto it = g_atvs.find(f.compositeKey);
+        if (it == g_atvs.end()) {
+            const auto byActor = FindByActor(f.obj);
+            if (byActor != g_atvs.end()) {
+                UE_LOGI("atv: ATV re-keyed -- '%ls' -> '%ls' spawner='%ls' (duplicate-Key ordinal shift; seat/author preserved)",
+                        byActor->first.c_str(), f.compositeKey.c_str(), f.spawnerKey.c_str());
+                AtvEntry e = std::move(byActor->second);
+                const auto kf = g_keyForActor.find(f.obj);
+                g_atvs.erase(byActor);
+                g_atvs[f.compositeKey] = std::move(e);
+                if (kf != g_keyForActor.end()) kf->second = f.compositeKey;
+                it = g_atvs.find(f.compositeKey);
+            } else {
+                AtvEntry e{};
+                e.actor = f.obj;
+                e.idx = f.idx;
+                e.spawnerKey = f.spawnerKey;
+                e.realKey = f.realKey;
+                e.spawnOrdinal = f.ordinal;
+                e.spawnSite = f.site;
+                e.siteValid = f.siteValid;
+                g_atvs[f.compositeKey] = std::move(e);
+                UE_LOGI("atv: ATV spawned -- key='%ls' spawner='%ls' actor=%p class='%ls'",
+                        f.compositeKey.c_str(), f.spawnerKey.c_str(), f.obj,
+                        R::ToString(R::NameOf(R::ClassOf(f.obj))).c_str());
+                it = g_atvs.find(f.compositeKey);
+            }
+        }
+        AtvEntry& e = it->second;
         if (e.actor && e.actor != f.obj) {
             e.occupantSlot = 0xFF; e.authorSlot = 0xFF;
             e.wasPoseAuthor = false;
@@ -325,6 +588,8 @@ size_t HubPassComplete(void*, bool isFull, uint32_t worldGen) {
         e.actor = f.obj;
         e.idx   = f.idx;
     }
+    DrainPendingAdopts();  // a snapshot that beat the hub pass binds now
+    RebuildSpawnerIndex();
     g_indexGen = worldGen;
     // The keys hash over the whole index, since on a tail pass `found` is only the new arrivals.
     uint64_t keysHash = 0;
@@ -336,6 +601,9 @@ size_t HubPassComplete(void*, bool isFull, uint32_t worldGen) {
                 "(compare host vs client for cross-peer Key stability)",
                 g_atvs.size(), static_cast<unsigned long long>(keysHash),
                 isFull ? "full" : "tail", found.size());
+        for (const auto& skv : g_bySpawner)
+            UE_LOGI("atv: spawner '%ls' holds %zu mirror(s)",
+                    skv.first.c_str(), skv.second.size());
     }
     g_scanFound.clear();
     return g_atvs.size();
@@ -410,6 +678,14 @@ void OnReliable(const coop::net::AtvStatePayload& payload, uint8_t senderPeerSlo
     if (key.empty()) { UE_LOGW("atv: OnReliable empty key -- dropping"); return; }
     if (!A::EnsureResolved()) return;
     if (!IndexCurrent()) return;  // a stale-generation index holds another world's ATVs; the stream re-sends
+    if (payload.adopt != 0) {
+        g_clientSawSnapshot = true;  // the host's connect snapshot is flowing
+        // Seed the save-placed set from the snapshot's save-spawner keys, so a save ATV that
+        // mints its Key after the snapshot still classifies save-placed, not a menu spawn.
+        std::wstring spawner, local;
+        if (SK::SplitCompositeKey(key, spawner, local) && spawner == SK::kSaveSpawner)
+            g_savePlacedKeys.insert(SK::SaveLocalRealKey(local));
+    }
     // A non-finite guard before the engine writes.
     if (!std::isfinite(payload.x) || !std::isfinite(payload.y) || !std::isfinite(payload.z) ||
         !std::isfinite(payload.pitch) || !std::isfinite(payload.yaw) || !std::isfinite(payload.roll)) {
@@ -417,7 +693,36 @@ void OnReliable(const coop::net::AtvStatePayload& payload, uint8_t senderPeerSlo
         return;
     }
     auto it = g_atvs.find(key);
-    if (it == g_atvs.end()) return;  // not indexed yet -- the throttled rebuild will pick it up
+    if (it == g_atvs.end()) {
+        // Snapshot adoption: the host's composite key for a save ATV may not match the local
+        // rule's. Duplicate-Key ordinals are spawn-site ordered, and the client captures sites
+        // at join time while the host captured them at world load, so mid-session movement can
+        // flip the order. Bind by realKey + proximity instead of dropping the stream; when no
+        // local actor is close yet the key waits for the hub pass (DrainPendingAdopts).
+        bool bound = false;
+        std::wstring spawner, local;
+        if (SK::SplitCompositeKey(key, spawner, local) && spawner == SK::kSaveSpawner) {
+            const std::wstring realKey = SK::SaveLocalRealKey(local);
+            const FVector saw{ payload.x, payload.y, payload.z };
+            void* bindActor = nullptr;
+            float bindDist = 0.f;
+            for (auto& kv : g_atvs) {
+                AtvEntry& c = kv.second;
+                if (c.spawnerKey != SK::kSaveSpawner || c.realKey != realKey) continue;
+                if (c.keyAdopted) continue;  // already bound to a (different) host key
+                if (!R::IsLiveByIndex(c.actor, c.idx)) continue;
+                FVector loc; FRotator rot;
+                if (!A::GetRootTransform(c.actor, loc, rot)) continue;
+                const float d = std::sqrt(Dist2(loc, saw.X, saw.Y, saw.Z));
+                if (d <= kAdoptBindCm) { bindActor = c.actor; bindDist = d; break; }
+            }
+            if (bindActor) bound = AdoptKeyToActor(key, realKey, bindActor, bindDist);
+            else StashPendingAdopt(key, realKey, saw);
+        }
+        if (!bound) return;  // not indexed yet -- the throttled rebuild will pick it up
+        it = g_atvs.find(key);
+        if (it == g_atvs.end()) return;
+    }
     AtvEntry& e = it->second;
     if (!R::IsLiveByIndex(e.actor, e.idx)) return;
 
@@ -449,6 +754,13 @@ void OnReliable(const coop::net::AtvStatePayload& payload, uint8_t senderPeerSlo
                 static_cast<unsigned>(payload.occupantSlot), key.c_str());
         return;
     }
+    if (e.occupantSlot != payload.occupantSlot || e.authorSlot != payload.authorSlot)
+        UE_LOGI("atv: occupant change -- key='%ls' seat %u -> %u author %u -> %u (from slot %u)",
+                key.c_str(), static_cast<unsigned>(e.occupantSlot),
+                static_cast<unsigned>(payload.occupantSlot),
+                static_cast<unsigned>(e.authorSlot),
+                static_cast<unsigned>(payload.authorSlot),
+                static_cast<unsigned>(senderPeerSlot));
     e.occupantSlot = payload.occupantSlot;
     e.authorSlot   = payload.authorSlot;
 
@@ -500,47 +812,129 @@ void OnAtvSpawn(const coop::net::AtvSpawnPayload& payload, uint8_t /*senderPeerS
     auto* s = g_session.load(std::memory_order_acquire);
     if (!s || s->role() == coop::net::Role::Host) return;  // client-only (the host owns the real ATV)
     if (!A::EnsureResolved()) return;
-    std::wstring synthKey = StringFromWireKey(payload.synthKey);
-    if (synthKey.empty()) { UE_LOGW("atv: OnAtvSpawn empty synthKey -- dropping"); return; }
-    if (g_atvs.find(synthKey) != g_atvs.end()) return;  // already spawned (re-announce / connect dup) -- idempotent
+    std::wstring menuKey = StringFromWireKey(payload.synthKey);
+    if (menuKey.empty()) { UE_LOGW("atv: OnAtvSpawn empty key -- dropping"); return; }
+    if (g_atvs.find(menuKey) != g_atvs.end()) return;  // already spawned (re-announce / connect dup) -- idempotent
     if (!std::isfinite(payload.x) || !std::isfinite(payload.y) || !std::isfinite(payload.z) ||
         !std::isfinite(payload.pitch) || !std::isfinite(payload.yaw) || !std::isfinite(payload.roll)) {
-        UE_LOGW("atv: OnAtvSpawn non-finite pose synthKey='%ls' -- dropping", synthKey.c_str());
+        UE_LOGW("atv: OnAtvSpawn non-finite pose key='%ls' -- dropping", menuKey.c_str());
         return;
     }
     std::wstring className = WireClassNameToString(payload.className);
-    if (className.empty()) { UE_LOGW("atv: OnAtvSpawn empty className synthKey='%ls' -- dropping", synthKey.c_str()); return; }
+    if (className.empty()) { UE_LOGW("atv: OnAtvSpawn empty className key='%ls' -- dropping", menuKey.c_str()); return; }
     const FVector loc{ payload.x, payload.y, payload.z };
     const FRotator rot{ payload.pitch, payload.yaw, payload.roll };
     void* spawned = A::SpawnMirror(className, loc, rot);  // physics LEFT ON -- a native idle grabbable ATV
     if (!spawned) {
-        UE_LOGW("atv: OnAtvSpawn SpawnMirror failed synthKey='%ls' class='%ls'", synthKey.c_str(), className.c_str());
+        UE_LOGW("atv: OnAtvSpawn SpawnMirror failed key='%ls' class='%ls'", menuKey.c_str(), className.c_str());
         return;
     }
     AtvEntry e{};
     e.actor = spawned;
     e.idx = R::InternalIndexOf(spawned);
     e.isClientSpawnedMirror = true;
-    g_atvs[synthKey] = std::move(e);
-    g_synthForActor[spawned] = synthKey;
-    UE_LOGI("atv: spawned runtime-ATV mirror synthKey='%ls' class='%ls' actor=%p loc=(%.0f, %.0f, %.0f)",
-            synthKey.c_str(), className.c_str(), spawned, loc.X, loc.Y, loc.Z);
+    // The spawner rides the key: the host's "menu#N" or another client's "menu@<slot>#N" that the
+    // host re-announced. Derive it rather than assuming the host's menu spawner.
+    std::wstring spawnerKey, localId;
+    if (SK::SplitCompositeKey(menuKey, spawnerKey, localId)) e.spawnerKey = spawnerKey;
+    else e.spawnerKey = SK::kHostMenuSpawner;
+    g_atvs[menuKey] = std::move(e);
+    g_keyForActor[spawned] = menuKey;
+    RebuildSpawnerIndex();
+    g_clientSawSnapshot = true;  // an announce means the host's snapshot is flowing
+    UE_LOGI("atv: mirror adopted -- spawned runtime-ATV mirror key='%ls' spawner='%ls' class='%ls' actor=%p loc=(%.0f, %.0f, %.0f)",
+            menuKey.c_str(), g_atvs[menuKey].spawnerKey.c_str(), className.c_str(), spawned, loc.X, loc.Y, loc.Z);
 }
 
 void OnAtvDestroy(const coop::net::AtvDestroyPayload& payload, uint8_t /*senderPeerSlot*/) {
     auto* s = g_session.load(std::memory_order_acquire);
     if (!s || s->role() == coop::net::Role::Host) return;  // client-only
-    std::wstring synthKey = StringFromWireKey(payload.synthKey);
-    if (synthKey.empty()) return;
+    std::wstring menuKey = StringFromWireKey(payload.synthKey);
+    if (menuKey.empty()) return;
     if (!IndexCurrent()) return;  // the pass prunes a dead-world entry itself
-    auto it = g_atvs.find(synthKey);
+    auto it = g_atvs.find(menuKey);
     if (it == g_atvs.end()) return;
     void* actor = it->second.actor;
     const bool destroyed = it->second.isClientSpawnedMirror && R::IsLiveByIndex(actor, it->second.idx) &&
                            A::DestroyMirror(actor);  // our own fresh spawn
-    if (actor) g_synthForActor.erase(actor);
+    if (actor) g_keyForActor.erase(actor);
+    const std::wstring spawnerKey = it->second.spawnerKey;
     g_atvs.erase(it);
-    UE_LOGI("atv: runtime-ATV mirror synthKey='%ls' %s", synthKey.c_str(),
+    RebuildSpawnerIndex();
+    UE_LOGI("atv: ATV destroyed -- key='%ls' spawner='%ls' (host-announced teardown; mirror %s)",
+            menuKey.c_str(), spawnerKey.c_str(),
+            destroyed ? "destroyed" : "dropped from the lane, not destroyed here");
+}
+
+void OnClientAtvSpawn(const coop::net::AtvSpawnPayload& payload, uint8_t senderPeerSlot) {
+    auto* s = g_session.load(std::memory_order_acquire);
+    if (!s || s->role() != coop::net::Role::Host) return;  // host-only (the client announce lands here)
+    if (!A::EnsureResolved()) return;
+    std::wstring menuKey = StringFromWireKey(payload.synthKey);
+    if (menuKey.empty()) { UE_LOGW("atv: OnClientAtvSpawn empty key -- dropping"); return; }
+    // The key must name the sender's own menu spawner: "menu@<slot>#<n>" with slot == sender.
+    // Anything else is a forged or misrouted announce.
+    uint8_t claimedSlot = 0xFF;
+    if (!SK::ParseClientMenuKey(menuKey, claimedSlot) || claimedSlot != senderPeerSlot) {
+        UE_LOGW("atv: OnClientAtvSpawn key='%ls' not the sender's menu spawner (sender=%u) -- dropping",
+                menuKey.c_str(), static_cast<unsigned>(senderPeerSlot));
+        return;
+    }
+    if (g_atvs.find(menuKey) != g_atvs.end()) return;  // re-announce / dup -- idempotent
+    if (!std::isfinite(payload.x) || !std::isfinite(payload.y) || !std::isfinite(payload.z) ||
+        !std::isfinite(payload.pitch) || !std::isfinite(payload.yaw) || !std::isfinite(payload.roll)) {
+        UE_LOGW("atv: OnClientAtvSpawn non-finite pose key='%ls' -- dropping", menuKey.c_str());
+        return;
+    }
+    std::wstring className = WireClassNameToString(payload.className);
+    if (className.empty()) { UE_LOGW("atv: OnClientAtvSpawn empty className key='%ls' -- dropping", menuKey.c_str()); return; }
+    const FVector loc{ payload.x, payload.y, payload.z };
+    const FRotator rot{ payload.pitch, payload.yaw, payload.roll };
+    void* spawned = A::SpawnMirror(className, loc, rot);  // the host's mirror of the client's ATV
+    if (!spawned) {
+        UE_LOGW("atv: OnClientAtvSpawn SpawnMirror failed key='%ls' class='%ls'", menuKey.c_str(), className.c_str());
+        return;
+    }
+    AtvEntry e{};
+    e.actor = spawned;
+    e.idx = R::InternalIndexOf(spawned);
+    e.isClientSpawnedMirror = true;  // fresh-spawned by us (the host), torn down on destroy
+    e.spawnerKey = SK::ClientMenuSpawnerForSlot(senderPeerSlot);
+    e.realKey.clear();
+    g_atvs[menuKey] = std::move(e);
+    g_keyForActor[spawned] = menuKey;
+    RebuildSpawnerIndex();
+    // Re-announce so the OTHER clients spawn mirrors. The originator drops it as a duplicate
+    // (it already keyed the ATV locally).
+    SendAtvSpawn(menuKey, spawned, /*slot*/ -1);
+    UE_LOGI("atv: client menu spawn adopted -- key='%ls' from slot=%u, host mirror actor=%p (re-announced)",
+            menuKey.c_str(), static_cast<unsigned>(senderPeerSlot), spawned);
+}
+
+void OnClientAtvDestroy(const coop::net::AtvDestroyPayload& payload, uint8_t senderPeerSlot) {
+    auto* s = g_session.load(std::memory_order_acquire);
+    if (!s || s->role() != coop::net::Role::Host) return;  // host-only
+    std::wstring menuKey = StringFromWireKey(payload.synthKey);
+    if (menuKey.empty()) return;
+    uint8_t claimedSlot = 0xFF;
+    if (!SK::ParseClientMenuKey(menuKey, claimedSlot) || claimedSlot != senderPeerSlot) {
+        UE_LOGW("atv: OnClientAtvDestroy key='%ls' not the sender's menu spawner (sender=%u) -- dropping",
+                menuKey.c_str(), static_cast<unsigned>(senderPeerSlot));
+        return;
+    }
+    if (!IndexCurrent()) return;  // the pass prunes a dead-world entry itself
+    auto it = g_atvs.find(menuKey);
+    if (it == g_atvs.end()) return;
+    void* actor = it->second.actor;
+    const bool destroyed = it->second.isClientSpawnedMirror && R::IsLiveByIndex(actor, it->second.idx) &&
+                           A::DestroyMirror(actor);  // the host's fresh spawn
+    if (actor) g_keyForActor.erase(actor);
+    g_atvs.erase(it);
+    RebuildSpawnerIndex();
+    // Re-announce so the other clients tear down their mirrors (the originator already pruned).
+    SendAtvDestroy(menuKey);
+    UE_LOGI("atv: client menu destroy adopted -- key='%ls' from slot=%u (mirror %s; re-announced)",
+            menuKey.c_str(), static_cast<unsigned>(senderPeerSlot),
             destroyed ? "destroyed" : "dropped from the lane, not destroyed here");
 }
 
@@ -556,9 +950,10 @@ void QueueConnectBroadcastForSlot(int peerSlot) {
     for (auto& kv : g_atvs) {
         AtvEntry& e = kv.second;
         if (!R::IsLiveByIndex(e.actor, e.idx)) continue;
-        // A synthetic-keyed ATV is announced first on the same lane, so the joiner fresh-spawns it
-        // before the pose lands.
-        if (IsSynthKey(kv.first)) { SendAtvSpawn(kv.first, e.actor, peerSlot); ++spawns; }
+        // A menu-spawned ATV is announced first on the same lane, so the joiner fresh-spawns it
+        // before the pose lands. Both the host's menu spawner and the adopted client menu@slot
+        // spawners seed the joiner.
+        if (SK::IsMenuSpawnerKey(kv.first)) { SendAtvSpawn(kv.first, e.actor, peerSlot); ++spawns; }
         // The change gate re-arms for the joiner: the snapshot is fire-once and a fresh joiner is
         // the peer most likely to drop it, and a satisfied gate would then send nothing until the
         // host's copy moved.
@@ -636,7 +1031,15 @@ void Tick() {
         e.wasPoseAuthor = authority;
 
         if (authority) {
+            if (isDriver && e.occupantSlot != localSlot)
+                UE_LOGI("atv: occupant change -- key='%ls' seat %u -> %u (local mount)",
+                        kv.first.c_str(), static_cast<unsigned>(e.occupantSlot),
+                        static_cast<unsigned>(localSlot));
             if (isDriver) e.occupantSlot = localSlot;   // claim the seat locally
+            if (e.authorSlot != localSlot)
+                UE_LOGI("atv: occupant change -- key='%ls' author %u -> %u (local authority)",
+                        kv.first.c_str(), static_cast<unsigned>(e.authorSlot),
+                        static_cast<unsigned>(localSlot));
             e.authorSlot = localSlot;
         }
 
@@ -711,10 +1114,15 @@ void OnDisconnect() {
     }
     const size_t n = g_atvs.size();
     g_atvs.clear();
-    g_synthForActor.clear();
+    g_keyForActor.clear();
     g_savePlacedKeys.clear();
     g_savePlacedActors.clear();
-    g_synthCounter = 0;
+    g_saveSites.clear();
+    g_bySpawner.clear();
+    g_pendingAdopts.clear();
+    g_menuCounter = 0;
+    g_clientMenuCounter = 0;
+    g_clientSawSnapshot = false;
     g_installed = false;  // a new session re-indexes via the next Install (latched again)
     const auto c  = coop::atv_corrector::ReadCounters();
     const auto hg = coop::atv_hit_guard::ReadCounters();
