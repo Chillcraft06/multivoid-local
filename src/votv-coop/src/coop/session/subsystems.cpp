@@ -123,6 +123,7 @@
 #include "coop/player/player_damage.h"
 #include "coop/session/player_handshake.h"  // TickSkinConverge
 #include "coop/session/worldrules_sync.h"  // host-edited world rules -> joiner
+#include "coop/furnace/furnace_sync.h"  // the furnace's door + fire state -> joiner
 #include "coop/player/skin_preview.h"
 #include "coop/net/session.h"
 #include "coop/creatures/npc_adoption.h"
@@ -331,6 +332,7 @@ void ConnectReplayForSlot(int slot) {
     coop::item_activate::QueueConnectBroadcastForSlot(slot);
     coop::weather_sync::QueueConnectBroadcastForSlot(slot);
     coop::interactable_sync::QueueConnectBroadcastForSlot(slot);  // door/light/container states
+    coop::furnace_sync::QueueConnectBroadcastForSlot(slot);  // the furnace's door + fire state
     coop::keypad_sync::QueueConnectBroadcastForSlot(slot);  // keypad states
     coop::worldrules_sync::QueueConnectBroadcastForSlot(slot);  // host-edited world rules
     coop::sky_sync::QueueConnectBroadcastForSlot(slot);  // night-sky orientation, moon phase, eye

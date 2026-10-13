@@ -4,6 +4,8 @@
 
 #include "coop/player/death_revive.h"
 
+#include "coop/furnace/furnace_sync.h"  // NotifyLocalDeath/NotifyLocalRevive clear burn flags
+
 #include "coop/config/config.h"
 #include "coop/net/protocol.h"  // kMaxPeers for the friend scan
 #include "coop/net/session.h"
@@ -677,6 +679,9 @@ void Tick(coop::net::Session& session, void* localPawn) {
     // has no flee to stand down for them.
     if (haveState && dead && !g_wasDead) {
         g_reviveRanThisDeath = false;
+        // The furnace lane clears the local burn flags on the death edge: a furnace death
+        // must not leave permanent burn audio/visuals behind.
+        coop::furnace_sync::NotifyLocalDeath();
         // The respawn chain's tier 2: where the player died, read on the edge before the ragdoll
         // can carry the corpse anywhere. Consumed once by the revive that follows this edge.
         g_deathPosValid = localPawn && E::TryGetActorLocation(localPawn, g_deathPos);
@@ -716,6 +721,8 @@ void Tick(coop::net::Session& session, void* localPawn) {
         g_reviveRanThisDeath = true;
         g_lastReviveOk = RunRevive(session, localPawn);
         if (g_lastReviveOk) {
+            // The furnace lane clears the local burn flags on a successful revive.
+            coop::furnace_sync::NotifyLocalRevive();
             g_armed.store(false, std::memory_order_release);
             g_cancelAtMs = 0;
             g_cancelAtMsAtomic.store(0, std::memory_order_release);

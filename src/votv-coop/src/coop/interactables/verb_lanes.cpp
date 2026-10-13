@@ -7,8 +7,8 @@
 #include "coop/interactables/door_verb_intent.h"
 #include "coop/interactables/drone_call_intent.h"
 #include "coop/interactables/eraser_press_intent.h"
-#include "coop/interactables/keypad_verbs.h"
-#include "coop/interactables/lightgroup_verbs.h"
+#include "coop/furnace/furnace_sync.h"  // the furnace (cremator): door + fire + occupant + burn clear
+#include "coop/interactables/keypad_verbs.h"#include "coop/interactables/lightgroup_verbs.h"
 #include "coop/interactables/toggle_verbs.h"
 #include "coop/net/session.h"
 
@@ -25,6 +25,7 @@ void Install(coop::net::Session& session) {
     coop::toggle_verbs::Install(&session);       // a symmetric device's state goes at the verb that writes it: each peer sends its own
     coop::keypad_verbs::Install(&session);       // a keypad's verbs: the host sends each, a client's own entries run on the host
     coop::desk_verb_intent::Install(&session);   // a client's press on the desk's save family is run by the host
+    coop::furnace_sync::Install(&session);      // the furnace (cremator): door + fire + occupant + burn clear
 }
 
 void Tick(coop::net::Session& session) {
@@ -36,6 +37,7 @@ void Tick(coop::net::Session& session) {
     coop::toggle_verbs::Tick();         // settle the toggle verb watches
     coop::keypad_verbs::Tick(session);  // settle the keypad watches; HOST: run queued keypad intents
     { ue_wrap::ScopedWalkTimer _w{"sync:desk_verb"}; coop::desk_verb_intent::Tick(session); }  // settle its seams; HOST: run one queued desk press a tick a client
+    coop::furnace_sync::Tick();  // settle the furnace watches; HOST: poll the fire state
 }
 
 void OnPeerLeft(uint8_t slot) {
@@ -55,6 +57,7 @@ void OnDisconnect() {
     coop::toggle_verbs::OnDisconnect();
     coop::keypad_verbs::OnDisconnect();
     coop::desk_verb_intent::OnDisconnect();
+    coop::furnace_sync::OnDisconnect();
 }
 
 }  // namespace coop::verb_lanes

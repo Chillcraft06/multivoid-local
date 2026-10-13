@@ -356,6 +356,7 @@ set(VOTVCOOP_SOURCES
     src/coop/element/identity_create.cpp
     src/coop/element/identity_destroy.cpp
     src/coop/element/portable_identity.cpp
+    src/coop/furnace/furnace_sync.cpp
     src/ue_wrap/core/component_calls.cpp
     src/coop/net/peer_admission.cpp
     src/coop/net/peer_admission_selftest.cpp

@@ -29,6 +29,7 @@
 #include "coop/props/join_membership_sweep.h"  // HasLoadTailQuiesced
 #include "coop/props/trash_pile_sync.h"
 #include "coop/session/worldrules_sync.h"  // the host-editable world rules lane
+#include "coop/furnace/furnace_sync.h"     // the furnace (cremator) lane
 
 #include "ue_wrap/core/game_thread.h"
 #include "ue_wrap/core/log.h"
@@ -759,6 +760,66 @@ bool HandleEntityEvent(net::Session& session,
         const int senderCopy = msg.senderPeerSlot;
         ue_wrap::game_thread::Post([pRule, senderCopy] {
             ::coop::worldrules_sync::OnRuleState(pRule, senderCopy);
+        });
+        break;
+    }
+    case net::ReliableKind::FurnaceDoorState: {
+        // Host to all: the furnace door's open state, keyed by the furnace actor's Key.
+        if (msg.payloadLen < sizeof(net::KeyedTogglePayload)) {
+            UE_LOGW("event_feed: FurnaceDoorState payload too short (%zu < %zu)",
+                    static_cast<size_t>(msg.payloadLen), sizeof(net::KeyedTogglePayload));
+            break;
+        }
+        net::KeyedTogglePayload pFurn{};
+        std::memcpy(&pFurn, msg.payload, sizeof(pFurn));
+        const int senderCopy = msg.senderPeerSlot;
+        ue_wrap::game_thread::Post([pFurn, senderCopy] {
+            ::coop::furnace_sync::OnDoorState(pFurn, senderCopy);
+        });
+        break;
+    }
+    case net::ReliableKind::FurnaceFireState: {
+        // Host to all: the furnace fire on/off plus the occupant slot.
+        if (msg.payloadLen < sizeof(net::FurnaceFirePayload)) {
+            UE_LOGW("event_feed: FurnaceFireState payload too short (%zu < %zu)",
+                    static_cast<size_t>(msg.payloadLen), sizeof(net::FurnaceFirePayload));
+            break;
+        }
+        net::FurnaceFirePayload pFire{};
+        std::memcpy(&pFire, msg.payload, sizeof(pFire));
+        const int senderCopy = msg.senderPeerSlot;
+        ue_wrap::game_thread::Post([pFire, senderCopy] {
+            ::coop::furnace_sync::OnFireState(pFire, senderCopy);
+        });
+        break;
+    }
+    case net::ReliableKind::FurnaceBurnClear: {
+        // Host to one/all: clear a player's stuck burn visuals and audio.
+        if (msg.payloadLen < sizeof(net::FurnaceBurnClearPayload)) {
+            UE_LOGW("event_feed: FurnaceBurnClear payload too short (%zu < %zu)",
+                    static_cast<size_t>(msg.payloadLen), sizeof(net::FurnaceBurnClearPayload));
+            break;
+        }
+        net::FurnaceBurnClearPayload pClear{};
+        std::memcpy(&pClear, msg.payload, sizeof(pClear));
+        const int senderCopy = msg.senderPeerSlot;
+        ue_wrap::game_thread::Post([pClear, senderCopy] {
+            ::coop::furnace_sync::OnBurnClear(pClear, senderCopy);
+        });
+        break;
+    }
+    case net::ReliableKind::FurnaceDoorIntent: {
+        // Client to host: drive the furnace door; the host's edge watch broadcasts.
+        if (msg.payloadLen < sizeof(net::KeyedTogglePayload)) {
+            UE_LOGW("event_feed: FurnaceDoorIntent payload too short (%zu < %zu)",
+                    static_cast<size_t>(msg.payloadLen), sizeof(net::KeyedTogglePayload));
+            break;
+        }
+        net::KeyedTogglePayload pIntent{};
+        std::memcpy(&pIntent, msg.payload, sizeof(pIntent));
+        const int senderCopy = msg.senderPeerSlot;
+        ue_wrap::game_thread::Post([pIntent, senderCopy] {
+            ::coop::furnace_sync::OnDoorIntent(pIntent, senderCopy);
         });
         break;
     }
