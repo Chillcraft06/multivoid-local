@@ -281,6 +281,9 @@ inline bool IsClientRelayableReliableKind(ReliableKind k) {
     case ReliableKind::ReelSlot:          // presser-authored
     case ReliableKind::MeadowAppend:      // presser-symmetric
     case ReliableKind::MeadowDelete:      // player-symmetric
+    // Overnight batch 2026-10-13: peer-authored interaction state, like ItemActivate.
+    case ReliableKind::PlayerGrabState:   // grabber-authored; the target applies the drag
+    case ReliableKind::PropHoldState:     // holder-authored; up to two holders
         return true;
     default:
         return false;

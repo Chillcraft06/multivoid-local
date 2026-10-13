@@ -981,9 +981,100 @@ enum class ReliableKind : uint8_t {
     // read, the first five effect entries and the effect total. Never relayed. Late join: none. Trust: as
     // StatOrderReply. StatQueryReplyPayload.
     StatQueryReply = 172,
+
+    // --- Overnight batch, 2026-10-13: values 173+ are fresh, none retired. ---
+    // Host to all: the furnace door's open state, keyed by the furnace actor's Key. Same trust
+    // shape as DoorState: host-authored, never relayed; a client's own door press reaches the
+    // host as an intent and the host re-broadcasts. Reuses KeyedTogglePayload.
+    FurnaceDoorState = 173,
+    // Host to all: the furnace fire on/off plus the occupant slot (-1 = empty), keyed by the
+    // furnace actor's Key. Trust: host-authored, never relayed. FurnaceFirePayload.
+    FurnaceFireState = 174,
+    // Host to one client (or all): clear that player's stuck burn visuals and audio, e.g. after
+    // a furnace death left them burning with no damage. Never relayed. FurnaceBurnClearPayload.
+    FurnaceBurnClear = 175,
+    // Any peer, relayed by the host: player-to-player grab, drag and throw. The grabber authors
+    // its own grab; the target's client applies the carried drag transform. PlayerGrabPayload.
+    PlayerGrabState = 176,
+    // Any peer, relayed by the host: a prop's holder set, one or two simultaneous holders for
+    // tug-of-war, keyed by the prop's key. PropHoldPayload.
+    PropHoldState = 177,
+    // Host to all: one world rule changed by the host in the rules panel. Host-authored, never
+    // relayed; clients apply it to their process copy. WorldRulePayload.
+    WorldRuleState = 178,
+    // Client to host: this client pressed the furnace door (open/close), keyed by the furnace
+    // actor's Key. The host drives its own door verbs; its edge watch then broadcasts
+    // FurnaceDoorState to everyone. Reuses KeyedTogglePayload. Never relayed: an intent
+    // addressed to the host alone, like DoorVerbIntent.
+    FurnaceDoorIntent = 179,
 };
 
 #pragma pack(push, 1)
+
+// --- Overnight batch payload structs (2026-10-13) ---
+// FurnaceFirePayload (ReliableKind::FurnaceFireState=174): the furnace's fire switch plus who is
+// inside. occupantSlot is the owning peer slot, -1 when empty.
+struct FurnaceFirePayload {
+    WireKey  key;          // 32 -- the furnace actor's Key FName (string)
+    uint8_t  fireOn;       // 1  -- 0 = off, 1 = on (the state AFTER the edge)
+    int8_t   occupantSlot; // 1  -- peer slot inside the furnace, -1 = none
+    uint8_t  _pad[6];      // 6  -- reserved
+};
+static_assert(sizeof(FurnaceFirePayload) == 40, "FurnaceFirePayload must be 40 bytes");
+static_assert(sizeof(FurnaceFirePayload) <= 256 - 20 - 8,
+              "FurnaceFirePayload must fit in one reliable datagram");
+
+// FurnaceBurnClearPayload (ReliableKind::FurnaceBurnClear=175): clear one player's stuck burn
+// visuals and audio (the furnace death left them burning with no damage behind it).
+struct FurnaceBurnClearPayload {
+    uint32_t playerElementId; // 4 -- whose burn state to clear
+    uint8_t  _pad[4];         // 4 -- reserved
+};
+static_assert(sizeof(FurnaceBurnClearPayload) == 8, "FurnaceBurnClearPayload must be 8 bytes");
+
+// PlayerGrabPayload (ReliableKind::PlayerGrabState=176): player-to-player grab, drag and throw.
+// action: 0 = release, 1 = grab, 2 = drag (pos/yaw authoritative), 3 = throw (pos + vel).
+struct PlayerGrabPayload {
+    uint32_t grabberElementId; // 4
+    uint32_t targetElementId;  // 4
+    uint8_t  action;           // 1 -- 0 release, 1 grab, 2 drag, 3 throw
+    uint8_t  _pad[3];          // 3 -- reserved
+    float    pos[3];           // 12 -- drag: authoritative target position; throw: release pos
+    float    vel[3];           // 12 -- throw: release velocity (unused otherwise)
+    float    yaw;              // 4  -- drag: authoritative facing (unused otherwise)
+};
+static_assert(sizeof(PlayerGrabPayload) == 40, "PlayerGrabPayload must be 40 bytes");
+static_assert(sizeof(PlayerGrabPayload) <= 256 - 20 - 8,
+              "PlayerGrabPayload must fit in one reliable datagram");
+
+// PropHoldPayload (ReliableKind::PropHoldState=177): a prop's holder set. holderCount 0 =
+// released, 1 = held, 2 = contested tug-of-war. action mirrors the count edge (0 release,
+// 1 grab, 2 contest).
+struct PropHoldPayload {
+    WireKey  key;                // 32 -- the prop's Key FName (string)
+    uint32_t holderElementId[2]; // 8  -- up to two simultaneous holders
+    uint8_t  holderCount;        // 1  -- 0, 1 or 2
+    uint8_t  action;            // 1  -- 0 release, 1 grab, 2 contest
+    uint8_t  _pad[6];            // 6  -- reserved
+};
+static_assert(sizeof(PropHoldPayload) == 48, "PropHoldPayload must be 48 bytes");
+static_assert(sizeof(PropHoldPayload) <= 256 - 20 - 8,
+              "PropHoldPayload must fit in one reliable datagram");
+
+// WorldRulePayload (ReliableKind::WorldRuleState=178): one world rule changed by the host.
+// kind: 0 = bool (bval), 1 = enum (ival ordinal), 2 = float (fval).
+struct WorldRulePayload {
+    uint32_t ruleKeyHash; // 4 -- CRC32 of the RuleField key string (e.g. "fallDamage")
+    uint8_t  kind;        // 1 -- 0 bool, 1 enum, 2 float
+    uint8_t  _pad[3];     // 3 -- reserved
+    union {
+        uint8_t bval;     // kind 0
+        int32_t ival;     // kind 1
+        float   fval;     // kind 2
+    } value;              // 4
+    uint8_t _pad2[4];     // 4 -- reserved
+};
+static_assert(sizeof(WorldRulePayload) == 16, "WorldRulePayload must be 16 bytes");
 
 // Every datagram starts with this. seq is per sender and monotonic; the receiver drops anything
 // older than the last it saw. senderEpoch is the sender's per-process epoch, minted non-zero at
