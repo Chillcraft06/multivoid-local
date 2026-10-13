@@ -18,6 +18,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Bring our console to the front: when launched from a fullscreen game the
+# window can open behind it and sit at a prompt nobody sees.
+try {
+    Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public static class MvWin { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); }
+"@
+    [MvWin]::SetForegroundWindow([MvWin]::GetConsoleWindow()) | Out-Null
+} catch { }
+
 $repo = "Chillcraft06/multivoid-local"
 $releaseTag = "dev-latest"
 
@@ -49,7 +59,7 @@ Write-Host "Checking for updates..."
 try {
     $release = Invoke-RestMethod `
         -Uri "https://api.github.com/repos/$repo/releases/tags/$releaseTag" `
-        -Headers $headers -UserAgent "multivoid-updater"
+        -Headers $headers -UserAgent "multivoid-updater" -UseBasicParsing
 } catch {
     if (-not $token) {
         Pause-Exit ("Could not reach the GitHub release API, and updater_token.txt is missing.`n" +
@@ -89,8 +99,12 @@ Write-Host ("Downloading " + $asset.name + " ...")
 $dlHeaders = $headers.Clone()
 $dlHeaders["Accept"] = "application/octet-stream"
 # asset.url is the API download URL (needs the token on a private repo).
-Invoke-WebRequest -Uri $asset.url -Headers $dlHeaders -OutFile $zipPath `
-    -UserAgent "multivoid-updater"
+try {
+    Invoke-WebRequest -Uri $asset.url -Headers $dlHeaders -OutFile $zipPath `
+        -UserAgent "multivoid-updater" -UseBasicParsing
+} catch {
+    Pause-Exit ("Download failed: " + $_.Exception.Message)
+}
 Write-Host "Downloaded."
 
 # --- confirm, then close the game -----------------------------------------
