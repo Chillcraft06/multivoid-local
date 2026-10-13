@@ -5,10 +5,10 @@
 #   2. Downloads the zip (with progress) if one is available.
 #   3. Asks before closing the game, closes it gracefully, installs, relaunches.
 #
-# The repo is private, so the GitHub API needs a token. Put a fine-grained PAT
-# with Contents set to READ-ONLY (nothing else) on Chillcraft06/multivoid-local
-# in updater_token.txt next to this script. Read-only means a leak can only
-# ever read this one repo. The installer preserves that file across updates.
+# The repo is public, so the GitHub API works with no token at all. If you ever
+# hit API rate limits, you can drop a fine-grained PAT with Contents set to
+# READ-ONLY (nothing else) on Chillcraft06/multivoid-local in updater_token.txt
+# next to this script. The installer preserves that file across updates.
 
 param(
     [int]$GamePid = 0,
@@ -52,9 +52,10 @@ try {
         -Headers $headers -UserAgent "multivoid-updater"
 } catch {
     if (-not $token) {
-        Pause-Exit ("Could not reach the release API, and updater_token.txt is missing.`n" +
-            "Create it next to this script containing a fine-grained GitHub PAT`n" +
-            "with Contents: READ-ONLY on $repo, then run the update again.")
+        Pause-Exit ("Could not reach the GitHub release API, and updater_token.txt is missing.`n" +
+            "Check your internet connection and try again. If it keeps failing,`n" +
+            "a fine-grained GitHub PAT with Contents: READ-ONLY on $repo`n" +
+            "in updater_token.txt next to this script raises the API rate limit.")
     }
     Pause-Exit ("Update check failed: " + $_.Exception.Message)
 }
