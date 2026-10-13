@@ -313,20 +313,7 @@ jobs:
         shell: pwsh
         run: |
           pwsh -File .github/ci/package.ps1 -BuildDir "${{ env.BUILD_DIR }}/Release" `
-                                               -OutDir "$env:RUNNER_TEMP/package" `
-                                               -KeepStage
-          exit $LASTEXITCODE
-
-      - name: Assemble the one-click profile zip + verify it
-        # The send-to-a-friend channel: a COMPLETE manager profile folder
-        # (official unreal_shimloader skeleton + this build's mod), zipped as
-        # Multivoid-r2modman-profile.zip. install-profile.ps1 downloads exactly
-        # this asset name from the rolling dev-latest release. Written to the
-        # same out dir so the collect step below picks it up with *.zip.
-        shell: pwsh
-        run: |
-          pwsh -File .github/ci/package-profile.ps1 -StageDir "$env:RUNNER_TEMP/package/stage" `
-                                                       -OutDir "$env:RUNNER_TEMP/package"
+                                               -OutDir "$env:RUNNER_TEMP/package"
           exit $LASTEXITCODE
 
       - name: Collect artifacts + toolchain dump

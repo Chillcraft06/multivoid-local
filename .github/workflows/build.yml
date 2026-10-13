@@ -53,11 +53,35 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout the built tree (profile skeleton + assembly script)
+        # Clean checkout FIRST: the default clean would wipe the artifact
+        # downloaded below, so the artifact download comes after this step.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+
       - name: Download build artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ needs.build.outputs.artifact-name }}
           path: ./dist
+
+      - name: Assemble the one-click profile zip
+        # Fork-only distribution step. The build itself runs upstream's
+        # build-core@main (design D11/R22), which knows nothing of the
+        # profile; the profile is assembled here, in the fork's own
+        # publish lane. The mod zip's layout IS the package.ps1 stage
+        # tree, so unpacking it gives package-profile.ps1 its input, and
+        # the publish step below attaches the profile zip via ./dist/*.zip.
+        shell: pwsh
+        run: |
+          $modZip = @(Get-ChildItem ./dist/Pelmentor-Multivoid-*.zip | Where-Object { $_.Name -notlike '*profile*' })
+          if ($modZip.Count -ne 1) { throw "expected exactly one mod zip in ./dist, found $($modZip.Count)" }
+          $stage = Join-Path $env:RUNNER_TEMP 'profile-stage'
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          Expand-Archive -Path $modZip[0].FullName -DestinationPath $stage -Force
+          pwsh -File .github/ci/package-profile.ps1 -StageDir $stage -OutDir ./dist
+          exit $LASTEXITCODE
 
       - name: Publish rolling dev-latest release
         env:

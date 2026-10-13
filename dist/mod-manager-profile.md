@@ -67,9 +67,16 @@ CI stamps it from a template with the generated version.
 
 Only `shimloader/mod/Chilltivoid/` changes per release. It is exactly the
 `package.ps1` stage tree, relocated. `.github/ci/package-profile.ps1` does
-the relocation; `build-core.yml` runs it after the package step (with
-`-KeepStage`), and the profile zip rides the same artifact to `dev-latest`
-next to the mod zip.
+the relocation. It runs in `build.yml`'s publish job (the fork's own
+distribution lane): the mod zip from the build artifact is unpacked as the
+stage tree, the profile zip is built next to it, and `./dist/*.zip`
+attaches both to `dev-latest`.
+
+Note: the build itself executes upstream's `build-core.yml@main` by design
+(D11/R22), which knows nothing of the profile. Do NOT add fork-only steps
+to the fork's `build-core.yml`: that file never executes in this repo's
+lanes, and its sha256 is part of the release fingerprint, so editing it
+breaks the release gate.
 
 | package.ps1 stage            | profile destination                        |
 |------------------------------|--------------------------------------------|
