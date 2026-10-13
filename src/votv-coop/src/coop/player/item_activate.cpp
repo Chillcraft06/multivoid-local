@@ -91,6 +91,28 @@ coop::net::ItemActivatePayload g_peerActivateCache[coop::players::kMaxPeers] = {
 // bounce back as a wire packet. Atomic, as the session pointer.
 std::atomic<bool> g_echoSuppress{false};
 
+// ---- Last-received desired state per peer, and the slow re-assert (HYPOTHESIS, unverified) ----
+// Observed (2026-10-13 playtest): a peer's beam synced at first, then stopped; rejoining and
+// re-toggling did not restore it. Every re-apply path (toggle send, join replay) exists and logs,
+// so the working hypothesis is that the apply lands and something on the RECEIVING machine then
+// re-writes the puppet's light_R (the puppet is a mainPlayer_C whose own flashlight logic reads
+// the bool we deliberately never write), or the puppet respawns and its fresh light_R starts off
+// with no new packet to drive it. This timer does NOT claim that cause; it only re-asserts the
+// last received desired state when the puppet's light disagrees with it, so either mechanism
+// self-heals within kReassertIntervalMs and the probe log shows the fight if it does not.
+// Game thread only: written from ApplyToPuppetOrDefer (the GT::Post dispatch), read and cleared
+// from TickConnect and the disconnect hooks. This is separate from the host's join-replay cache
+// above, which is host-only; the re-assert must run on clients too.
+bool g_lastRxValid[coop::players::kMaxPeers] = {};
+coop::net::ItemActivatePayload g_lastRxPayload[coop::players::kMaxPeers] = {};
+
+inline constexpr uint64_t kReassertIntervalMs = 2000;
+uint64_t g_lastReassertMs = 0;
+// The local light's re-assert is edge-triggered (one fix per disagreement episode) so it can
+// never fight the game's own BP every interval if the game legitimately keeps the light off
+// while the bool is on.
+bool g_localLightDisagreed = false;
+
 bool ProbeLogEnabled() {
     // Read once per process: the observer is hot.
     static const bool s_enabled = ::coop::config::ResolveFlag(::coop::config_registry::rows::flashlight_log);
@@ -220,6 +242,13 @@ void OnUpdateFlashlightPost(void* self, void* function, void* /*params*/) {
 
     coop::net::ItemActivatePayload p{};
     if (!BuildPayloadFromLocal(self, p, s)) return;
+
+    if (ProbeLogEnabled()) {
+        UE_LOGI("flashlight: POST %s payload state=%d mode=%u Intensity=%.2f outerCone=%.1f "
+                "innerCone=%.1f senderElementId=0x%08x -- about to send",
+                which, p.state, p.mode, p.intensity, p.outerConeAngle, p.innerConeAngle,
+                p.senderElementId);
+    }
 
     // Only the first observer of a logical change sends: the signature covers state, mode,
     // intensity and cones.
@@ -408,6 +437,10 @@ void ApplyToPuppet(void* puppetActor, const coop::net::ItemActivatePayload& payl
                 "(puppet=%p)", puppetActor);
         return;
     }
+    if (ProbeLogEnabled()) {
+        UE_LOGI("flashlight: puppet=%p light_R=%p resolved (senderPeerSlot=%u)",
+                puppetActor, light_R, static_cast<unsigned>(senderPeerSlot));
+    }
 
     // The puppet's existing light_R is driven through SetVisibility and SetIntensity only. The
     // puppet's flashlight bool is not written (it triggers the updateFlashlight ubergraph, an
@@ -464,6 +497,11 @@ void ApplyToPuppetOrDefer(uint8_t senderPeerSlot, void* puppetActor,
                 static_cast<unsigned>(senderPeerSlot));
         return;
     }
+    // Stage (c) probe: the packet as received, before any routing decision.
+    UE_LOGI("flashlight: RX ItemActivate peerSlot=%u state=%d mode=%u Intensity=%.2f "
+            "outerCone=%.1f innerCone=%.1f senderElementId=0x%08x puppet=%p",
+            static_cast<unsigned>(senderPeerSlot), p.state, p.mode, p.intensity,
+            p.outerConeAngle, p.innerConeAngle, p.senderElementId, puppetActor);
     // The host remembers each client's latest item state, applied or deferred, for a later joiner;
     // the host's own state goes through QueueConnectBroadcastForSlot.
     if (senderPeerSlot >= 1) {
@@ -474,9 +512,16 @@ void ApplyToPuppetOrDefer(uint8_t senderPeerSlot, void* puppetActor,
             }
         }
     }
+    // The receiver-side desired-state cache (both roles, latest wins): the slow re-assert in
+    // TickConnect re-applies it when the puppet's light disagrees. Written on every receive,
+    // applied or deferred.
+    g_lastRxPayload[senderPeerSlot] = p;
+    g_lastRxValid[senderPeerSlot] = true;
     if (puppetActor && R::IsLive(puppetActor)) {
         // The puppet is ready: a stale pending entry clears and the apply runs now.
         g_pendingApplyValid[senderPeerSlot] = false;
+        UE_LOGI("flashlight: peerSlot=%u puppet ready (%p) -- applying now",
+                static_cast<unsigned>(senderPeerSlot), puppetActor);
         ApplyToPuppet(puppetActor, p, senderPeerSlot);
         return;
     }
@@ -551,6 +596,81 @@ void ReplayPeerStatesToSlot(int newSlot) {
     }
 }
 
+// The slow re-assert pass, throttled to kReassertIntervalMs. See the HYPOTHESIS block above:
+// it re-applies the last received ON state when the puppet's light disagrees with it, and
+// repairs the local light once per disagreement episode. Called from TickConnect (game thread).
+void TickReassert() {
+    const uint64_t nowMs = ::GetTickCount64();
+    if (nowMs - g_lastReassertMs < kReassertIntervalMs) return;
+    g_lastReassertMs = nowMs;
+
+    auto& reg = coop::players::Registry::Get();
+
+    // The peers: a cached ON whose puppet light reads off gets the payload re-applied. This
+    // covers a puppet that respawned (its fresh light_R starts off) and, if the clobber
+    // hypothesis holds, re-lights a beam the game rewrote; the REASSERT log line then shows
+    // the fight explicitly instead of a silent death.
+    for (uint8_t peer = 0; peer < coop::players::kMaxPeers; ++peer) {
+        if (!g_lastRxValid[peer]) continue;
+        const coop::net::ItemActivatePayload& want = g_lastRxPayload[peer];
+        if (want.state == 0) continue;  // off is the puppet default; nothing to re-assert
+        if (want.itemClassHash != g_flashlightClassHash) continue;
+        auto* rp = reg.Puppet(peer);
+        if (!rp || !rp->valid()) continue;
+        void* puppet = rp->GetActor();
+        if (!puppet || !R::IsLive(puppet)) continue;
+        void* light_R = ue_wrap::engine::GetMainPlayerLightR(puppet);
+        if (!light_R) continue;  // the next interval retries; the RX probe log shows the gap
+        ue_wrap::engine::FlashlightSnapshot snap{};
+        if (!ue_wrap::engine::ReadFlashlightSnapshot(light_R, snap)) continue;
+        // The light agrees when visible with a clearly-on intensity; the off sentinel is about
+        // 0.2 Unitless, so 1.0 separates them (the same threshold as the sender's latch).
+        if (snap.visible && snap.intensity > 1.f) continue;
+        UE_LOGI("flashlight: REASSERT peerSlot=%u (hypothesis: post-apply clobber or respawn) -- "
+                "puppet=%p light disagrees (bVisible=%d Intensity=%.2f), re-applying state=%d "
+                "Intensity=%.2f",
+                static_cast<unsigned>(peer), puppet,
+                snap.visible ? 1 : 0, snap.intensity, want.state, want.intensity);
+        ApplyToPuppet(puppet, want, peer);
+    }
+
+    // The local light: the game's BP owns it, so this only ever repairs, never fights -- one
+    // fix per disagreement episode (edge-triggered), and only when the bool says ON with a
+    // real flashlight equipped (the crank lantern drives its own components, not light_R).
+    void* mp = reg.Local();
+    if (mp && R::IsLive(mp)) {
+        ue_wrap::engine::MainPlayerFlashlightState fl{};
+        if (ue_wrap::engine::ReadMainPlayerFlashlightState(mp, fl) &&
+            fl.flashlight && fl.hasFlashlight && !fl.crankFlashlight) {
+            void* light_R = ue_wrap::engine::GetMainPlayerLightR(mp);
+            ue_wrap::engine::FlashlightSnapshot snap{};
+            const bool snapOk =
+                light_R && ue_wrap::engine::ReadFlashlightSnapshot(light_R, snap);
+            if (!light_R || !snapOk) {
+                g_localLightDisagreed = false;  // nothing to drive; do not wedge the flag
+            } else {
+                const bool agrees = snap.visible && snap.intensity > 1.f;
+                if (!agrees && !g_localLightDisagreed) {
+                    float target = g_latchedOnIntensity.load(std::memory_order_acquire);
+                    if (target == 0.f) target = kIntensityOnFallback;
+                    g_echoSuppress.store(true, std::memory_order_release);
+                    ue_wrap::engine::SetSceneComponentVisibility(light_R, true, false);
+                    ue_wrap::engine::SetLightIntensity(light_R, target);
+                    g_echoSuppress.store(false, std::memory_order_release);
+                    g_localLightDisagreed = true;
+                    UE_LOGI("flashlight: REASSERT local light (hypothesis: the game clobbered "
+                            "it) -- bool=ON but light_R=%p read off, drove Intensity=%.2f",
+                            light_R, target);
+                } else if (agrees) {
+                    g_localLightDisagreed = false;
+                }
+            }
+        } else {
+            g_localLightDisagreed = false;
+        }
+    }
+}
+
 void TickConnect() {
 
     // The pending applies drain once the registry has a live puppet for the slot.
@@ -568,6 +688,9 @@ void TickConnect() {
                 p.state, p.intensity);
         ApplyToPuppet(puppet, p, peer);
     }
+
+    // The slow re-assert of the last received desired state (hypothesis, see above).
+    TickReassert();
 }
 
 void OnDisconnect() {
@@ -579,7 +702,11 @@ void OnDisconnect() {
         // The replay cache goes too: on a fresh session a different peer may reuse the slot.
         g_peerActivateValid[i] = false;
         g_peerActivateCache[i] = {};
+        // And the re-assert's desired-state cache: it belonged to the dead session.
+        g_lastRxValid[i] = false;
+        g_lastRxPayload[i] = {};
     }
+    g_localLightDisagreed = false;
     if (clearedApplies > 0) {
         UE_LOGI("flashlight: OnDisconnect cleared %d pending apply slot(s)",
                 clearedApplies);
@@ -592,6 +719,8 @@ void OnDisconnectForSlot(int peerSlot) {
     // flashlight.
     g_peerActivateValid[peerSlot] = false;
     g_peerActivateCache[peerSlot] = {};
+    g_lastRxValid[peerSlot] = false;
+    g_lastRxPayload[peerSlot] = {};
     if (!g_pendingApplyValid[peerSlot]) return;
     UE_LOGI("flashlight: peer slot %d disconnected -- clearing pending apply (state=%d intensity=%.2f)",
             peerSlot, g_pendingApplyPayload[peerSlot].state,

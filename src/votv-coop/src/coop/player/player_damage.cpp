@@ -140,11 +140,22 @@ void OnWireDamage(const coop::net::PlayerDamagePayload& p) {
         const bool isPup = reg.IsPuppet(mp);
         float before = -1.f, after = -1.f;
         ue_wrap::vitals::Read(ue_wrap::vitals::Field::Health, &before);
-        const bool ok = E::InvokeAddPlayerDamage(mp, damage);
+        // The native blood path: AddPlayerDamage's `blood` parameter gates the game's own
+        // bloodLoss effect block (the effect_bloodLoss_C actor, its blood particles/decals and
+        // the red wash), which a synthetic hit otherwise never produces. This lambda is the
+        // single application point of the PlayerDamage lane (one wire packet runs it once), so
+        // one packet arms exactly one effect: no new protocol kind, no second damage lane.
+        // Guard: only arm it when the hit can actually land (the player was alive going in), so
+        // a packet arriving for an already-dead player cannot bleed a corpse. The before/after
+        // reads below are the audit that health really dropped; a read failure (-1) fails
+        // closed, arming nothing. The puppet-side red hurt flash is untouched.
+        const bool wasAlive = (before > 0.f);
+        const bool ok = E::InvokeAddPlayerDamage(mp, damage, /*blood=*/wasAlive);
         ue_wrap::vitals::Read(ue_wrap::vitals::Field::Health, &after);
         UE_LOGI("player_damage: applied %.1f to own player (targetEid=%u) -> ok=%d, "
-                "saveSlot.health %.2f -> %.2f [mp possessed=%d isPuppet=%d]",
-                damage, targetEid, ok ? 1 : 0, before, after, possessed ? 1 : 0, isPup ? 1 : 0);
+                "saveSlot.health %.2f -> %.2f blood=%d [mp possessed=%d isPuppet=%d]",
+                damage, targetEid, ok ? 1 : 0, before, after, wasAlive ? 1 : 0,
+                possessed ? 1 : 0, isPup ? 1 : 0);
     });
 }
 
