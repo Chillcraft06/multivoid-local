@@ -598,6 +598,33 @@ std::wstring UpdaterModDir() {
     return s_dir;
 }
 
+// Resolve a possibly-virtualized path to the real on-disk path. The r2modman
+// "unreal_shimloader" redirects <game>/Binaries/Win64/Mods/... to the active
+// profile folder via API detours (NtCreateFile, GetFileAttributesW, ...), so a
+// path that is valid inside this process does not exist for an unhooked child
+// process like powershell.exe -- the file check above sees through the
+// redirection, but PowerShell gets "the -File parameter does not exist".
+// Opening the file and asking the OS for the final path behind the handle sees
+// through it, because GetFinalPathNameByHandleW itself is not detoured.
+// Falls back to the input path when anything fails (direct installs are
+// unaffected: the resolved path is identical modulo the \\?\ prefix).
+std::wstring UpdaterRealPathOf(const std::wstring& virtualPath) {
+    HANDLE h = ::CreateFileW(virtualPath.c_str(), 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return virtualPath;
+    std::vector<wchar_t> buf(32768);
+    DWORD n = ::GetFinalPathNameByHandleW(h, buf.data(), (DWORD)buf.size(), FILE_NAME_NORMALIZED);
+    ::CloseHandle(h);
+    if (n == 0 || n >= buf.size()) return virtualPath;
+    std::wstring real(buf.data(), n);
+    if (real.compare(0, 8, L"\\\\?\\UNC\\") == 0)
+        real = L"\\\\" + real.substr(8);
+    else if (real.compare(0, 4, L"\\\\?\\") == 0)
+        real.erase(0, 4);
+    return real;
+}
+
 void LaunchUpdaterScript() {
     const std::wstring modDir = UpdaterModDir();
     if (modDir.empty()) {
@@ -609,11 +636,18 @@ void LaunchUpdaterScript() {
         UE_LOGW("updater: updater.ps1 missing from the mod folder (install a build that ships it)");
         return;
     }
+    // De-virtualize: hand PowerShell real on-disk paths, since it runs outside
+    // the shimloader's redirection. modDirReal is the profile folder the game
+    // actually loads the mod from, which is also the correct install target.
+    const std::wstring ps1Real = UpdaterRealPathOf(ps1);
+    const size_t slash = ps1Real.find_last_of(L"\\/");
+    const std::wstring modDirReal =
+        (slash == std::wstring::npos) ? modDir : ps1Real.substr(0, slash);
     wchar_t gameExe[MAX_PATH] = {};
     ::GetModuleFileNameW(nullptr, gameExe, MAX_PATH);
-    const std::wstring args = L"-NoProfile -ExecutionPolicy Bypass -File \"" + ps1 +
+    const std::wstring args = L"-NoProfile -ExecutionPolicy Bypass -File \"" + ps1Real +
         L"\" -GamePid " + std::to_wstring(::GetCurrentProcessId()) +
-        L" -GameExe \"" + gameExe + L"\" -ModDir \"" + modDir + L"\"";
+        L" -GameExe \"" + gameExe + L"\" -ModDir \"" + modDirReal + L"\"";
     const INT_PTR r = reinterpret_cast<INT_PTR>(
         ::ShellExecuteW(nullptr, L"open", L"powershell.exe", args.c_str(), nullptr, SW_SHOWNORMAL));
     if (r <= 32)
