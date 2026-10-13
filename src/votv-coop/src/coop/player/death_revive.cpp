@@ -5,9 +5,11 @@
 #include "coop/player/death_revive.h"
 
 #include "coop/config/config.h"
+#include "coop/net/protocol.h"  // kMaxPeers for the friend scan
 #include "coop/net/session.h"
 #include "coop/session/net_pump.h"
 #include "coop/session/teleport_client.h"
+#include "ue_wrap/actors/sleep.h"  // FindBed for the bed tier
 #include "ue_wrap/actors/vitals.h"
 #include "ue_wrap/core/call.h"
 #include "ue_wrap/core/log.h"
@@ -43,9 +45,9 @@ constexpr const wchar_t* kBlackScreenClass = L"blackScreen_C";
 // death branch of its Tick ever writes Visible, so the restore value is a constant off the asset.
 constexpr uint8_t kSlateCollapsed = 1;
 
-// How close to the KPP the player must land for the reposition to count. The teleport either
-// lands or falls through its tiers, so this is an assertion, not a drift tolerance.
-constexpr float kAtKppToleranceCm = 300.f;
+// How close to the CHOSEN respawn target the player must land for the reposition to count. The
+// teleport either lands or falls through its tiers, so this is an assertion, not a drift tolerance.
+constexpr float kAtTargetToleranceCm = 300.f;
 
 std::atomic<coop::net::Session*> g_session{nullptr};
 std::atomic<int32_t>  g_deadByte{-1};
@@ -206,8 +208,9 @@ bool ClearBlackScreen() {
 // [1] ui_damageIndicator_C.dmg_full.Visibility: the Tick's death branch sets it Visible while the
 // widget authors it Collapsed, and the alive path never writes it, so once dead for a single tick
 // a full-screen red image draws over everything for good.
-// gameInstance.subArea := None is still left alone: the revive puts the player at the KPP,
-// outdoors, where None is correct, and the trigger volumes re-establish it.
+// gameInstance.subArea := None is still left alone: the revive's respawn chain lands the player
+// outdoors in the common tiers (friend, death spot, gate), where None is correct, and the trigger
+// volumes re-establish it.
 // Best-effort: a failure here is cosmetic or latent, never a reason to strand the player, so it
 // is not a term of the revive's conjunction.
 void ReconcileRunEndLatches() {
@@ -343,14 +346,109 @@ bool ClearDeadFlag(void* pawn) {
 }
 
 // False when the pawn's location cannot be read.
-bool DistanceToKpp(void* pawn, float& out) {
+bool DistanceTo(void* pawn, const ue_wrap::FVector& to, float& out) {
     ue_wrap::FVector at{};
     if (!E::TryGetActorLocation(pawn, at)) return false;
-    const float dx = at.X - P::name::kKPPSpawnX;
-    const float dy = at.Y - P::name::kKPPSpawnY;
-    const float dz = at.Z - P::name::kKPPSpawnZ;
+    const float dx = at.X - to.X;
+    const float dy = at.Y - to.Y;
+    const float dz = at.Z - to.Z;
     out = std::sqrt(dx * dx + dy * dy + dz * dz);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// RESPAWN LOCATION (2026-10-13, RULES agent -- Jordan: veto the ORDER in the morning).
+//
+// The revive no longer always returns the player to the gate (KPP). The target is picked by a
+// fallback chain, each tier failing safe to the next:
+//   1. NEAR A SURVIVING FRIEND: the nearest remote player whose pose is live and whose
+//      healthFrac > 0 (alive), +250 cm on X so the two bodies do not overlap. "Nearest" is
+//      measured from the death location when it is known, else from the corpse. Alive is a
+//      hypothesis: a dead remote peer's own client packs health 0, and a gone peer has no pose.
+//   2. DEATH LOCATION: the local pawn's position on the rising edge of `dead`, recorded in Tick
+//      before the ragdoll can carry the corpse anywhere. Single-use: consumed by the revive that
+//      follows the edge, so a run-ending (which never sets `dead`) cannot inherit a stale spot.
+//   3. THE PLAYER'S BED: the game tracks no per-player bed ownership, so this is the first live
+//      bed_C in the world (ue_wrap::sleep::FindBed) +250 cm on X, not inside the mattress. No
+//      bed in the world: skip.
+//   4. THE GATE (KPP): the old behavior, last resort -- always available.
+// The conjunction's positional term is "within 300 cm of the CHOSEN target", not "at the KPP".
+// ---------------------------------------------------------------------------
+
+// Where the player died, on the rising edge of `dead`. Game thread only (written in Tick,
+// consumed once by RunRevive).
+ue_wrap::FVector g_deathPos{};
+bool             g_deathPosValid = false;
+
+// Not inside the friend, not inside the mattress: one body-width sideways.
+constexpr float kRespawnOffsetCm = 250.f;
+
+// Tier 1: the nearest living remote player. `from` is the death location when known, else the
+// corpse; the offset lands the revived player beside the friend, at the friend's height.
+bool PickFriendTarget(coop::net::Session& session, const ue_wrap::FVector& from,
+                      ue_wrap::FVector& out) {
+    bool found = false;
+    float best = 0.f;
+    for (int slot = 0; slot < coop::net::kMaxPeers; ++slot) {
+        coop::net::PoseSnapshot pose{};
+        if (!session.TryGetRemotePose(slot, &pose)) continue;  // no pose: gone or never arrived
+        if (pose.healthFrac == 0) continue;                     // not a surviving friend
+        const float dx = pose.x - from.X;
+        const float dy = pose.y - from.Y;
+        const float dz = pose.z - from.Z;
+        const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (!found || d < best) {
+            found = true;
+            best = d;
+            out = ue_wrap::FVector{pose.x + kRespawnOffsetCm, pose.y, pose.z};
+        }
+    }
+    return found;
+}
+
+// Tier 3: the first live bed in the world. The game names no owner for a bed, so "the player's
+// bed" is the best available proxy: a base with one bed lands on it.
+bool PickBedTarget(ue_wrap::FVector& out) {
+    void* bed = ue_wrap::sleep::FindBed();
+    if (!bed || !R::IsLive(bed)) return false;
+    ue_wrap::FVector at{};
+    if (!E::TryGetActorLocation(bed, at)) return false;
+    out = ue_wrap::FVector{at.X + kRespawnOffsetCm, at.Y, at.Z};
+    return true;
+}
+
+struct RespawnTarget {
+    ue_wrap::FVector pos{};
+    const char* tier = "gate";  // which tier picked it, for the revive's line
+};
+
+RespawnTarget PickRespawnTarget(coop::net::Session& session, void* pawn) {
+    RespawnTarget t;
+    t.tier = "gate";
+    t.pos = ue_wrap::FVector{P::name::kKPPSpawnX, P::name::kKPPSpawnY, P::name::kKPPSpawnZ};
+
+    ue_wrap::FVector from{};
+    bool haveFrom = false;
+    if (g_deathPosValid) {
+        from = g_deathPos;
+        haveFrom = true;
+    } else if (pawn && E::TryGetActorLocation(pawn, from)) {
+        haveFrom = true;
+    }
+
+    ue_wrap::FVector at{};
+    if (haveFrom && PickFriendTarget(session, from, at)) {
+        t.pos = at;
+        t.tier = "friend";
+    } else if (g_deathPosValid) {
+        t.pos = g_deathPos;
+        t.tier = "death";
+    } else if (PickBedTarget(at)) {
+        t.pos = at;
+        t.tier = "bed";
+    }
+    g_deathPosValid = false;  // single-use: the next revive re-arms it at its own death edge
+    return t;
 }
 
 // The revive: six writes, then the conjunction, each verified by reading the world back rather
@@ -389,11 +487,12 @@ bool RunRevive(coop::net::Session& session, void* pawn) {
     //    forceGetUp (a latent delay that re-reads dead) and not wakeup (refuses while dead).
     const bool wokeUp = E::ForceMainPlayerWakeup(pawn);
 
-    // 4. Reposition to the KPP, not spawnLocation, which is just the transform at level start and
-    //    can be kilometres from the corpse after a long session. The same landmark the client
-    //    teleport uses on join.
+    // 4. Reposition: the respawn chain (near a surviving friend > death location > the player's
+    //    bed > the gate), not always the KPP. spawnLocation is just the transform at level start
+    //    and can be kilometres from the corpse after a long session.
+    const RespawnTarget target = PickRespawnTarget(session, pawn);
     const bool teleReported = coop::teleport_client::ApplyLocally(
-        {P::name::kKPPSpawnX, P::name::kKPPSpawnY, P::name::kKPPSpawnZ, 0.f, 0.f, 0.f});
+        {target.pos.X, target.pos.Y, target.pos.Z, 0.f, 0.f, 0.f});
 
     // 5. Only now the flag. (The menu-prep restore that used to sit here is gone with the writes
     //    it undid: cancelling the loadLevel body means they are never made.)
@@ -405,11 +504,11 @@ bool RunRevive(coop::net::Session& session, void* pawn) {
     const bool haveState = E::ReadMainPlayerRagdollState(pawn, isRagdoll, deadNow);
     float hp = -1.f;
     const bool haveHp = V::Read(V::Field::Health, &hp);
-    float dist = -1.f;   // -1: unread, never at the KPP
-    const bool distRead = DistanceToKpp(pawn, dist);
+    float dist = -1.f;   // -1: unread, never at the target
+    const bool distRead = DistanceTo(pawn, target.pos, dist);
     // The positional term is load-bearing: ApplyLocally has a tiered fallback, so its report says a
     // call succeeded, not that the player moved.
-    const bool atKpp = distRead && dist <= kAtKppToleranceCm;
+    const bool atTarget = distRead && dist <= kAtTargetToleranceCm;
 
     // The conjunction is about the player, not the screen. With blackCleared as a term, one run in
     // four saw the same-frame IsInViewport read after RemoveFromParent still true, and a living
@@ -417,19 +516,18 @@ bool RunRevive(coop::net::Session& session, void* pawn) {
     // artifacts are retried on the following pump ticks instead.
     const bool ok = vitalsOk && wokeUp && teleReported &&
                     deadCleared && haveState && !isRagdoll && !deadNow && haveHp && hp > 0.f &&
-                    atKpp;
+                    atTarget;
 
     UE_LOGI("death_revive: REVIVE %s after a run-ending authored by %ls -- vitals=%d wake=%d "
             "tele=%d deadClr=%d "
             "| screen (retried, NOT a gate): black=%d dmgRed=%.2f bloodLoss=%.0f actor(s) @%.1fs "
-            "| readback: ragdoll=%d dead=%d hp=%.1f distKPP=%.0f cm (tol %.0f)",
+            "| readback: ragdoll=%d dead=%d hp=%.1f tier=%s dist=%.0f cm (tol %.0f)",
             ok ? "OK" : "FAILED",
             g_pendingAuthorClass.empty() ? L"(unrecorded)" : g_pendingAuthorClass.c_str(),
             vitalsOk ? 1 : 0, wokeUp ? 1 : 0,
             teleReported ? 1 : 0, deadCleared ? 1 : 0, blackCleared ? 1 : 0, redBefore, bloodActors, bloodTimeBefore,
             haveState ? (isRagdoll ? 1 : 0) : -1, haveState ? (deadNow ? 1 : 0) : -1,
-            haveHp ? hp : -1.f, dist, kAtKppToleranceCm);
-    (void)session;
+            haveHp ? hp : -1.f, target.tier, dist, kAtTargetToleranceCm);
     return ok;
 }
 
@@ -506,6 +604,7 @@ void OnSessionStart() {
     g_lastReviveOk = false;
     g_cancelAtMs = 0;
     g_screenCleanupLeft = 0;
+    g_deathPosValid = false;
     g_pendingAuthorClass.clear();
     g_pendingAuthorIsLocalPawn = false;
 }
@@ -578,6 +677,9 @@ void Tick(coop::net::Session& session, void* localPawn) {
     // has no flee to stand down for them.
     if (haveState && dead && !g_wasDead) {
         g_reviveRanThisDeath = false;
+        // The respawn chain's tier 2: where the player died, read on the edge before the ragdoll
+        // can carry the corpse anywhere. Consumed once by the revive that follows this edge.
+        g_deathPosValid = localPawn && E::TryGetActorLocation(localPawn, g_deathPos);
         if (armReady) {
             g_armed.store(true, std::memory_order_release);
             UE_LOGI("death_revive: local death ARMED -- the native death runs to completion "

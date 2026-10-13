@@ -8,6 +8,9 @@
 #include "ue_wrap/engine/world_identity.h"
 #include "ui/scale.h"
 
+#include "coop/player/roster.h"
+#include "coop/session/worldrules_sync.h"
+
 #include "imgui.h"
 
 #include <algorithm>
@@ -15,6 +18,7 @@
 #include <cstdio>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ui::world_rules_panel {
@@ -39,6 +43,12 @@ struct ViewRow {
     bool        locked = false;  // ...and the reason is a lock. The game shows exactly ONE of two
                                  // overlay images: img_locked (red) when the rule is locked, and
                                  // img_disabled (white) when it is merely switched off.
+    // The edit half (host only): the raw values behind the text, and an enum's own option list.
+    GR::Kind kind = GR::Kind::Bool;
+    float    fval = 0.f;
+    int      ival = 0;
+    int      decimals = 2;       // the game's slider precision for this row
+    std::vector<std::pair<int, std::string>> enumOptions;  // enum only: the game's named values
 };
 struct ViewCategory {
     std::string          name;
@@ -70,7 +80,9 @@ GR::Kind KindOf(GP::Control c) {
 ViewRow MakeRow(const GR::RuleField& f, const GP::Row* row, const GP::LockInputs& lock) {
     ViewRow out;
     out.key = f.key;
+    out.kind = f.kind;
     out.label = (row && !row->label.empty()) ? row->label : f.label;
+    out.decimals = row ? row->sliderDecimals : 2;
     char buf[32];
     switch (f.kind) {
         case GR::Kind::Bool:
@@ -79,10 +91,15 @@ ViewRow MakeRow(const GR::RuleField& f, const GP::Row* row, const GP::LockInputs
             out.value = f.bval ? "On" : "Off";
             break;
         case GR::Kind::Float:
+            out.fval = f.fval;
             std::snprintf(buf, sizeof(buf), "%.*f", row ? row->sliderDecimals : 2, f.fval);
             out.value = buf;
             break;
         case GR::Kind::Enum:
+            out.ival = f.ival;
+            // The game's own option list for the combo, probed once per process and cached: an
+            // out-of-range ordinal cannot be authored because it is never offered.
+            out.enumOptions = GR::EnumOptions(f.key);
             if (f.valueName.empty()) { std::snprintf(buf, sizeof(buf), "#%d", f.ival); out.value = buf; }
             else out.value = f.valueName;
             break;
@@ -182,6 +199,30 @@ void RequestSnapshot() {
 
 }  // namespace
 
+// Public refresh: the render calls RequestSnapshot on (re)open itself; the rules sync calls this
+// after a remote apply so a client re-renders without reopening the panel.
+void RequestRefresh() { RequestSnapshot(); }
+
+namespace {
+
+// One edit from the panel into the sync queue, then the game-thread drain. The drain re-validates
+// against the live rules (kind match, enum ordinal in the game's name list, float finite and
+// clamped) and writes the process + saved copies; the host's accepted edits broadcast.
+void SubmitEdit(const std::string& key, GR::Kind kind, bool bval, int ival, float fval) {
+    if (!coop::worldrules_sync::RequestRuleEdit(key, kind, bval, ival, fval)) return;
+    GT::Post([] { coop::worldrules_sync::DrainEditQueue(); });
+}
+
+// Whether this peer may author rules: the host of a live session, or solo (no session at all --
+// the game's own menu lets a solo player edit). Clients keep the read-only view.
+bool CanEditRules() {
+    coop::roster::Snapshot snap;
+    coop::roster::GetSnapshot(snap);
+    return !snap.inSession || snap.localIsHost;
+}
+
+}  // namespace
+
 void Render() {
     // Re-snapshot on the (re)open edge (Render() wasn't called last frame -> the tab was just
     // selected) and whenever the world changed under an open panel: the rules belong to a world, and
@@ -196,7 +237,21 @@ void Render() {
 
     if (ImGui::SmallButton("Refresh")) RequestSnapshot();
     ImGui::SameLine();
-    ImGui::TextDisabled("Read-only. The host's save sets the rules for everyone.");
+    // Host-only editing: the host (or a solo player, who the game's own menu lets edit) gets
+    // controls; clients keep the read-only view.
+    const bool canEdit = CanEditRules();
+    if (canEdit)
+        ImGui::TextDisabled("You are the host: change a value and it applies now, saves with "
+                            "the world, and syncs to clients.");
+    else
+        ImGui::TextDisabled("Read-only. The host's save sets the rules for everyone.");
+    // A rule changed under the panel (our own edit, or the host's broadcast): re-snapshot.
+    static uint32_t s_changeSeen = 0;  // render thread only
+    const uint32_t changeGen = coop::worldrules_sync::ChangeGeneration();
+    if (changeGen != s_changeSeen) {
+        s_changeSeen = changeGen;
+        RequestSnapshot();
+    }
 
     static View s_view;       // render thread only
     static int  s_viewGen = 0;
@@ -277,7 +332,37 @@ void Render() {
                 s_selected = row.key;
             if (row.greyed) ImGui::PopStyleColor();
             ImGui::TableSetColumnIndex(1);
-            if (row.isCheck && row.on && !row.greyed) ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.f), "%s", row.value.c_str());
+            // Host-only editing: a checkbox, a drag box, or the game's own option list per kind.
+            // Locked / switched-off rows stay as the game leaves them, for the host too.
+            const bool editable = canEdit && !row.greyed;
+            const std::string editId = "##ruleedit_" + row.key;
+            if (editable && row.isCheck) {
+                bool on = row.on;
+                if (ImGui::Checkbox(editId.c_str(), &on) && on != row.on)
+                    SubmitEdit(row.key, row.kind, on, 0, 0.f);
+            } else if (editable && row.kind == GR::Kind::Float) {
+                float v = row.fval;
+                char fmt[16];
+                std::snprintf(fmt, sizeof(fmt), "%%.%df", row.decimals);
+                ImGui::SetNextItemWidth(-1);
+                ImGui::DragFloat(editId.c_str(), &v, 0.01f, 0.f, 0.f, fmt);
+                // One edit per gesture, not one per tick of the drag.
+                if (ImGui::IsItemDeactivatedAfterEdit() && v != row.fval)
+                    SubmitEdit(row.key, row.kind, false, 0, v);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Applied on release; clamped to 10x of the current value, never NaN.");
+            } else if (editable && row.kind == GR::Kind::Enum && !row.enumOptions.empty()) {
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::BeginCombo(editId.c_str(), row.value.c_str())) {
+                    for (const auto& opt : row.enumOptions) {
+                        const bool sel = opt.first == row.ival;
+                        if (ImGui::Selectable(opt.second.c_str(), sel) && !sel)
+                            SubmitEdit(row.key, row.kind, false, opt.first, 0.f);
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            } else if (row.isCheck && row.on && !row.greyed) ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.f), "%s", row.value.c_str());
             else if (row.isCheck || row.greyed)        ImGui::TextDisabled("%s", row.value.c_str());
             else                        ImGui::TextUnformatted(row.value.c_str());
         }

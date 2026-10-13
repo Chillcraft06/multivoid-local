@@ -19,4 +19,9 @@ namespace ui::world_rules_panel {
 // Draw the World Rules pane content (called from dev_menu's content child).
 void Render();
 
+// Re-read the rules on the game thread (the next snapshot the render paints). The render calls
+// this on (re)open and on world change itself; the rules sync calls it after a remote apply so a
+// client re-renders without reopening the panel. Render-thread safe.
+void RequestRefresh();
+
 }  // namespace ui::world_rules_panel

@@ -7,9 +7,12 @@
 #include "ue_wrap/world/world_singleton.h"
 #include "ue_wrap/world/game_mode.h"  // the mode byte: a GI member, not one of the rules
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cwctype>
+#include <unordered_map>
 
 namespace ue_wrap::game_rules {
 namespace {
@@ -191,6 +194,131 @@ int ApplySavedToProcess(void* gameInstance, void* save) {
     // The members are bools, bytes and one float: a plain value copy is the whole assignment.
     std::memcpy(dst, src, static_cast<size_t>(size));
     return changed;
+}
+
+// The two struct bases a rule write touches: the process copy on the GameInstance and the saved
+// copy on its save object. The struct type must be the same on both sides, or the bytes do not
+// mean the same thing (the ApplySavedToProcess check).
+bool ResolveRuleBases(void*& giOut, void*& saveOut, void*& structObjOut,
+                      uint8_t*& procBaseOut, uint8_t*& savedBaseOut) {
+    giOut = saveOut = structObjOut = nullptr;
+    procBaseOut = savedBaseOut = nullptr;
+    void* gi = world_singleton::GameInstance();
+    if (!gi) return false;
+    void* giClass = R::ClassOf(gi);
+    if (!giClass) return false;
+    const int32_t procOff = R::FindPropertyOffset(giClass, L"gameRules");
+    void* structObj = R::PropertyInnerStruct(giClass, L"gameRules");
+    if (procOff < 0 || !structObj) return false;
+    const int32_t saveOff = R::FindPropertyOffset(giClass, L"save_gameInst");
+    if (saveOff < 0) return false;
+    void* save = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(gi) + saveOff);
+    if (!save || !R::IsLive(save)) return false;
+    void* saveClass = R::ClassOf(save);
+    const int32_t savedOff = saveClass ? R::FindPropertyOffset(saveClass, L"localGameRules") : -1;
+    void* savedStruct = saveClass ? R::PropertyInnerStruct(saveClass, L"localGameRules") : nullptr;
+    if (savedOff < 0 || !savedStruct || savedStruct != structObj) return false;
+    giOut = gi;
+    saveOut = save;
+    structObjOut = structObj;
+    procBaseOut = reinterpret_cast<uint8_t*>(gi) + procOff;
+    savedBaseOut = reinterpret_cast<uint8_t*>(save) + savedOff;
+    return true;
+}
+
+bool ClampFloatEdit(float current, float desired, float& out) {
+    if (!std::isfinite(desired)) return false;
+    const float m = (std::max)(std::fabs(current), 1.0f);
+    const float bound = 10.0f * m;
+    out = (std::min)((std::max)(desired, -bound), bound);
+    return std::isfinite(out);
+}
+
+std::vector<std::pair<int, std::string>> EnumOptions(const std::string& key) {
+    static std::unordered_map<std::string, std::vector<std::pair<int, std::string>>> s_cache;
+    const auto hit = s_cache.find(key);
+    if (hit != s_cache.end()) return hit->second;
+    std::vector<std::pair<int, std::string>> opts;
+    void* gi = nullptr;
+    void* save = nullptr;
+    void* structObj = nullptr;
+    uint8_t* proc = nullptr;
+    uint8_t* saved = nullptr;
+    if (ResolveRuleBases(gi, save, structObj, proc, saved)) {
+        for (const R::StructFieldInfo& fi : R::EnumerateStructFields(structObj)) {
+            if (TrimmedKey(fi.name) != key) continue;
+            int32_t bOff = -1;
+            uint8_t bMask = 0;
+            const bool isBool =
+                R::FindBoolProperty(structObj, fi.name.c_str(), bOff, bMask) && bOff >= 0;
+            if (isBool || fi.size == 4) break;  // not an enum rule: no options
+            void* enumObj = R::PropertyEnum(structObj, fi.name.c_str());
+            if (!enumObj) break;
+            // VotV's rule enums are dense from 0 (the hypothesis): probe until the names run out,
+            // with a short tail so a sparse enum still terminates. A truncated list only ever
+            // offers FEWER choices, never an invalid ordinal -- fail closed.
+            int misses = 0;
+            for (int v = 0; v < 256 && misses < 8; ++v) {
+                std::string name = EnumValueName(enumObj, static_cast<uint8_t>(v));
+                if (name.empty()) { ++misses; continue; }
+                misses = 0;
+                opts.emplace_back(v, std::move(name));
+            }
+            break;
+        }
+    }
+    s_cache[key] = opts;
+    return opts;
+}
+
+bool WriteRule(const std::string& key, const RuleField& value) {
+    void* gi = nullptr;
+    void* save = nullptr;
+    void* structObj = nullptr;
+    uint8_t* proc = nullptr;
+    uint8_t* saved = nullptr;
+    if (!ResolveRuleBases(gi, save, structObj, proc, saved)) return false;
+    for (const R::StructFieldInfo& fi : R::EnumerateStructFields(structObj)) {
+        if (TrimmedKey(fi.name) != key) continue;
+        int32_t bOff = -1;
+        uint8_t bMask = 0;
+        const bool isBool =
+            R::FindBoolProperty(structObj, fi.name.c_str(), bOff, bMask) && bOff >= 0;
+        const bool isFloat = !isBool && fi.size == 4;
+        const bool isEnum = !isBool && !isFloat;
+        // A kind disagreement writes nothing: the caller named the wrong slot.
+        if ((isBool && value.kind != Kind::Bool) || (isFloat && value.kind != Kind::Float) ||
+            (isEnum && value.kind != Kind::Enum))
+            return false;
+        if (isBool) {
+            if (value.bval) {
+                proc[bOff] |= bMask;
+                saved[bOff] |= bMask;
+            } else {
+                proc[bOff] &= static_cast<uint8_t>(~bMask);
+                saved[bOff] &= static_cast<uint8_t>(~bMask);
+            }
+            return true;
+        }
+        if (isFloat) {
+            const float cur = *reinterpret_cast<float*>(proc + fi.offset);
+            float clamped = 0.f;
+            if (!ClampFloatEdit(cur, value.fval, clamped)) return false;
+            *reinterpret_cast<float*>(proc + fi.offset) = clamped;
+            *reinterpret_cast<float*>(saved + fi.offset) = clamped;
+            return true;
+        }
+        // Enum: the ordinal must be one of the game's own named values.
+        bool named = false;
+        for (const auto& opt : EnumOptions(key)) {
+            if (opt.first == value.ival) { named = true; break; }
+        }
+        if (!named) return false;
+        proc[fi.offset] = static_cast<uint8_t>(value.ival);
+        saved[fi.offset] = static_cast<uint8_t>(value.ival);
+        return true;
+    }
+    return false;  // no rule by that key
 }
 
 }  // namespace ue_wrap::game_rules

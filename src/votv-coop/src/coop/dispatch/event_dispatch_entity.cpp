@@ -28,6 +28,7 @@
 #include "coop/props/remote_prop_spawn.h"
 #include "coop/props/join_membership_sweep.h"  // HasLoadTailQuiesced
 #include "coop/props/trash_pile_sync.h"
+#include "coop/session/worldrules_sync.h"  // the host-editable world rules lane
 
 #include "ue_wrap/core/game_thread.h"
 #include "ue_wrap/core/log.h"
@@ -743,6 +744,21 @@ bool HandleEntityEvent(net::Session& session,
                 ::coop::players::Registry::Get().Puppet(peerSlotCopy);
             void* puppetNow = (rp && rp->valid()) ? rp->GetActor() : nullptr;
             ::coop::item_activate::ApplyToPuppetOrDefer(peerSlotCopy, puppetNow, pCopy);
+        });
+        break;
+    }
+    case net::ReliableKind::WorldRuleState: {
+        // Host to all: one world rule changed by the host in the F1 rules panel.
+        if (msg.payloadLen < sizeof(net::WorldRulePayload)) {
+            UE_LOGW("event_feed: WorldRuleState payload too short (%zu < %zu)",
+                    static_cast<size_t>(msg.payloadLen), sizeof(net::WorldRulePayload));
+            break;
+        }
+        net::WorldRulePayload pRule{};
+        std::memcpy(&pRule, msg.payload, sizeof(pRule));
+        const int senderCopy = msg.senderPeerSlot;
+        ue_wrap::game_thread::Post([pRule, senderCopy] {
+            ::coop::worldrules_sync::OnRuleState(pRule, senderCopy);
         });
         break;
     }

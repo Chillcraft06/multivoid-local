@@ -15,6 +15,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ue_wrap::game_rules {
@@ -61,5 +62,27 @@ const RuleField* NthOfKind(const std::vector<RuleField>& rules, Kind kind, int n
 // on a BeginPlay. Returns how many rules the copy changed, 0 when the two already agreed, -1 when
 // either struct could not be resolved (nothing written). Game thread.
 int ApplySavedToProcess(void* gameInstance, void* save);
+
+// Write one rule by key to BOTH copies the game keeps: the process copy
+// (mainGameInstance.gameRules -- takes effect now) and the saved copy
+// (saveSlot.localGameRules -- persists into the save). The write walks the struct's members the
+// same way ReadRulesAt does, so the field mapping mirrors ApplySavedToProcess. Fail-closed: the
+// key must name a rule, value.kind must be the rule's own kind, enum ordinals must be one of the
+// game's named values for that rule (see EnumOptions), floats must be finite and are clamped to
+// the edit bound (see ClampFloatEdit). Returns false and writes nothing otherwise. Game thread.
+bool WriteRule(const std::string& key, const RuleField& value);
+
+// The game's named values for an enum rule: (ordinal, display name) for every ordinal whose
+// enumerator the game's own library names, in ordinal order. An edit UI offers exactly these, so
+// an out-of-range ordinal cannot be authored. Cached per process (the enum sets are fixed per
+// game build). Empty when the key names no enum rule, or nothing resolved. Game thread.
+std::vector<std::pair<int, std::string>> EnumOptions(const std::string& key);
+
+// The sane bound for a float-rule edit. The game's own min/max is not discoverable in the
+// reflected data (the pane row carries only the decimal count), so the fallback is 10x of the
+// rule's current value with a floor of 1.0, symmetric about zero: a rule at 1.0 allows -10..10,
+// a rule at 0 allows -10..10. NaN and inf never pass, whatever the bound. Pure math, but part
+// of the game-thread write path conceptually.
+bool ClampFloatEdit(float current, float desired, float& out);
 
 }  // namespace ue_wrap::game_rules
