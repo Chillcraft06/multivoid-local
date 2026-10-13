@@ -13,6 +13,7 @@
 
 #include "coop/net/endpoint_log.h"
 #include "coop/net/peer_identity.h"
+#include "coop/net/signaling_crypto.h"
 #include "signaling_proof.h"
 #include "ue_wrap/core/log.h"
 
@@ -170,11 +171,33 @@ struct SignalingClient::ConnectionSignaling : ISteamNetworkingConnectionSignalin
                     const void* pMsg, int cbMsg) override {
         (void)hConn;
         (void)info;
+        // Signaling encryption (coop/net/signaling_crypto): the ICE blob is sealed for this
+        // peer's identity before it touches the wire. The ECDH is static and non-interactive,
+        // so the first message is already encrypted. Clean refusal: a peer we cannot derive a
+        // key for, or a seal failure, sends nothing and returns false -- never plaintext.
+        signaling_crypto::SessionKey key{};
+        {
+            std::lock_guard<std::recursive_mutex> lk(owner_->sockMutex_);
+            if (!owner_->SigEncKeyForLocked(peerIdentity_, key)) {
+                UE_LOGE("signaling: no signaling key for peer '%s' -- refusing to send ICE",
+                        peerIdentity_.c_str());
+                return false;
+            }
+        }
+        std::string envelope;
+        if (!signaling_crypto::Seal(key, static_cast<const uint8_t*>(pMsg),
+                                    static_cast<size_t>(cbMsg > 0 ? cbMsg : 0), envelope)) {
+            UE_LOGE("signaling: sealing ICE for peer '%s' failed -- refusing to send",
+                    peerIdentity_.c_str());
+            return false;
+        }
+        std::memset(key.bytes, 0, sizeof key.bytes);
         std::string signal;
-        signal.reserve(peerIdentity_.size() + static_cast<size_t>(cbMsg) * 2 + 4);
+        signal.reserve(peerIdentity_.size() + envelope.size() * 2 + 4);
         signal.append(peerIdentity_);
         signal.push_back(' ');
-        for (const uint8_t* p = static_cast<const uint8_t*>(pMsg); cbMsg > 0; --cbMsg, ++p) {
+        const uint8_t* const ebeg = reinterpret_cast<const uint8_t*>(envelope.data());
+        for (const uint8_t* p = ebeg; p < ebeg + envelope.size(); ++p) {
             signal.push_back(kHexDigit[*p >> 4U]);
             signal.push_back(kHexDigit[*p & 0xf]);
         }
@@ -232,6 +255,13 @@ std::shared_ptr<SignalingClient> SignalingClient::Create(const std::string& serv
     if (!client->resolved_) {
         UE_LOGE("signaling: could not resolve signaling server '%s'",
                 endpoint_log::LogEndpoint(serverAddr).c_str());
+        return nullptr;
+    }
+    // The signaling-encryption primitives self-test before first use: if the crypto is broken,
+    // proceeding would send undecryptable (or, worse, silently plaintext) signaling, so the
+    // transport is refused instead.
+    if (!signaling_crypto::RunSelftest()) {
+        UE_LOGE("signaling: signaling_crypto selftest FAILED -- P2P transport unavailable");
         return nullptr;
     }
     return client;
@@ -451,6 +481,21 @@ void SignalingClient::EnqueueFront(const std::string& line) {
 }
 
 // The per-connection signaling factory.
+bool SignalingClient::SigEncKeyForLocked(const std::string& peerIdentity,
+                                         signaling_crypto::SessionKey& out) {
+    // Caller holds sockMutex_.
+    const auto it = sigEncKeys_.find(peerIdentity);
+    if (it != sigEncKeys_.end()) {
+        out = it->second;
+        return true;
+    }
+    signaling_crypto::SessionKey key{};
+    if (!signaling_crypto::DeriveSessionKey(peerIdentity, key)) return false;
+    sigEncKeys_[peerIdentity] = key;
+    out = key;
+    return true;
+}
+
 ISteamNetworkingConnectionSignaling* SignalingClient::CreateSignalingForConnection(
     const SteamNetworkingIdentity& peer) {
     SteamNetworkingIdentityRender peerRender(peer);
@@ -759,6 +804,31 @@ void SignalingClient::Poll() {
                         data.push_back(static_cast<char>((dh << 4) | dl));
                     }
                     if (ok && !data.empty()) {
+                        // Signaling decryption (coop/net/signaling_crypto): the payload is a
+                        // sealed envelope for us, sent by the relay-stamped identity on the
+                        // line. Anything that does not open under that sender's key is dropped
+                        // -- clean refusal, no plaintext fallback, so a mixed-version peer's
+                        // plaintext simply fails to connect here. The key is copied under the
+                        // lock and the crypto runs outside it: ReceivedP2PCustomSignal takes a
+                        // GNS lock, and this dispatch pass must not hold sockMutex_ across it.
+                        const std::string senderId(inBuf_.data() + cursor, spc - cursor);
+                        signaling_crypto::SessionKey key{};
+                        bool keyOk = false;
+                        {
+                            std::lock_guard<std::recursive_mutex> lk(sockMutex_);
+                            keyOk = SigEncKeyForLocked(senderId, key);
+                        }
+                        std::string plaintext;
+                        const bool opened =
+                            keyOk && signaling_crypto::Open(
+                                         key,
+                                         reinterpret_cast<const uint8_t*>(data.data()),
+                                         data.size(), plaintext);
+                        std::memset(key.bytes, 0, sizeof key.bytes);
+                        if (!opened) {
+                            UE_LOGW("signaling: dropping undecryptable signal from '%s'",
+                                    senderId.c_str());
+                        } else {
                         // The receive context: an inbound connect request goes through the normal
                         // listen-socket state machine, with CreateSignalingForConnection as the reply
                         // channel. Rejections are silently ignored, since returning a failure lets an
@@ -782,7 +852,8 @@ void SignalingClient::Poll() {
                         Context ctx;
                         ctx.owner = this;
                         sockets_->ReceivedP2PCustomSignal(
-                            data.c_str(), static_cast<int>(data.size()), &ctx);
+                            plaintext.c_str(), static_cast<int>(plaintext.size()), &ctx);
+                        }
                     }
                 }
             }

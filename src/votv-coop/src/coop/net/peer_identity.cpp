@@ -592,6 +592,12 @@ Sig SignBlob(const uint8_t* data, size_t len) {
     return sig;
 }
 
+bool LocalPrivateSeed(uint8_t out[kPrivKeyBytes]) {
+    if (!g_loaded) return false;
+    std::memcpy(out, g_priv, kPrivKeyBytes);
+    return true;
+}
+
 bool VerifyBlob(const PubKey& pub, const uint8_t* data, size_t len, const Sig& sig) {
     return ed25519_sign_open(data, len, pub.data(), sig.data()) == 0;
 }

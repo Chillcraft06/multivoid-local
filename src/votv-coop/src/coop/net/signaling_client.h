@@ -22,6 +22,9 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+
+#include "coop/net/signaling_crypto.h"  // SessionKey (the per-peer signaling-encryption cache)
 
 #pragma warning(push)
 #pragma warning(disable: 4100 4127 4191 4244 4245 4267 4310 4324 4458)
@@ -130,6 +133,13 @@ private:
     bool RegistrationFreshLocked(std::chrono::steady_clock::time_point now) const;
     bool RegistrationAbsentLocked() const;
 
+    // The cached signaling-encryption session key for `peerIdentity` (rendered "gen:<64 hex>"),
+    // deriving and caching on first use. False when the identity is malformed or our own key is
+    // not loaded; the caller must then refuse the signal, never fall back to plaintext. Caller
+    // holds sockMutex_.
+    bool SigEncKeyForLocked(const std::string& peerIdentity,
+                            signaling_crypto::SessionKey& out);
+
     const std::string host_;
     const std::string service_;     // port, as a string for getaddrinfo
     const std::string token_;       // shared bearer token sent in the greeting
@@ -147,6 +157,12 @@ private:
     unsigned char resolvedAddr_[128] = {};  // >= sizeof(sockaddr_storage) (128 on Win)
 
     std::recursive_mutex sockMutex_;
+    // Per-peer signaling-encryption session keys (coop/net/signaling_crypto), by the peer's
+    // rendered identity ("gen:<64 hex>"). The ECDH is static and non-interactive, so the first
+    // ICE message is already encrypted; the cache avoids a scalar multiplication per message.
+    // Guarded by sockMutex_ (recursive). A peer whose key cannot be derived is refused, never
+    // sent plaintext.
+    std::unordered_map<std::string, signaling_crypto::SessionKey> sigEncKeys_;
     // SOCKET as uintptr_t, so this header needs no winsock include (and its ordering constraint on
     // every includer); ~0 is INVALID_SOCKET.
     std::uintptr_t sock_ = static_cast<std::uintptr_t>(~static_cast<std::uintptr_t>(0));

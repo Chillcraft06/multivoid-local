@@ -76,6 +76,11 @@ bool PublicKeyFromIdentityString(const std::string& identity, PubKey& out);
 // a weak nonce.
 bool RandomBytes(void* out, size_t len);
 
+// Our own Ed25519 private seed (32 bytes), for the signaling channel's static ECDH key
+// agreement (coop/net/signaling_crypto). False when no key is loaded. The seed is secret:
+// the caller must never log it, never put it on the wire, and zero its copy when done.
+bool LocalPrivateSeed(uint8_t out[kPrivKeyBytes]);
+
 // The canonical short form of any identity (a hash prefix of the public key, 32 lowercase hex
 // chars), used by the host to name a remote peer's stored rows. Pure; empty if the key is not
 // plausible.
