@@ -41,9 +41,6 @@ constexpr float kMaxDamagePerHit = 1000.f;
 
 bool ValidDamage(float d) { return std::isfinite(d) && d > 0.f && d <= kMaxDamagePerHit; }
 
-// Forward: defined below; called by OnImpactDamageCppPre.
-void SendPlayerDamageWithImpulse(int ownerSlot, float damage, float ix, float iy, float iz);
-
 // Mass tier boundary for prop-vs-puppet impacts (kg). From Jordan's 2026-10-14 tutorial-level
 // mass dump: hand items (drives, tools, crowbar, reelbox) top out at 20.5 kg; the next heaviest
 // is a 37.4 kg cardboard box, then 84+ kg furniture. 30 kg sits in the gap. Below: the prop just
