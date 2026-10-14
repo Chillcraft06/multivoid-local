@@ -5,9 +5,8 @@
 #   into the mod manager's profiles folder. No explorer tango required.
 #
 # .USAGE
-#   Double-click install-profile.bat (runs this script with -ExecutionPolicy
-#   Bypass, so a downloaded copy isn't blocked by PowerShell's execution
-#   policy), or run manually:
+#   This script is fetched and run by dist/install-profile.bat (the release
+#   asset). Double-click the .bat. To run manually:
 #     powershell -ExecutionPolicy Bypass -File install-profile.ps1
 #
 #   No token or setup needed. Just run it.

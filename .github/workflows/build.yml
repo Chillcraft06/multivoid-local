@@ -91,7 +91,7 @@ jobs:
           SHA="${{ github.sha }}"
           REPO="${{ github.repository }}"
           gh release delete "$TAG" --cleanup-tag -y -R "$REPO" || true
-          gh release create "$TAG" ./dist/*.zip ./dist/install-profile.ps1 ./dist/install-profile.bat \
+          gh release create "$TAG" ./dist/*.zip ./dist/install-profile.bat \
             --title "dev-latest" \
             --prerelease \
             -R "$REPO" \
@@ -99,7 +99,7 @@ jobs:
 
           Rolling development build of the Multivoid fork.
           The in-game updater (F1 > Mod > Update) installs the mod zip.
-          install-profile.ps1 installs Multivoid-r2modman-profile.zip,
-          the complete mod-manager profile for friends. Double-click
-          install-profile.bat to run the installer (it bypasses the
-          execution-policy block on downloaded scripts)."
+          install-profile.bat is the one-click profile installer for friends:
+          double-click it and it downloads install-profile.ps1 from the
+          repo, then installs Multivoid-r2modman-profile.zip, the complete
+          mod-manager profile."
