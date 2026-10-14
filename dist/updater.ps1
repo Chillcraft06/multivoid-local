@@ -119,6 +119,33 @@ if ($answer -notmatch '^[Yy]') {
     Pause-Exit "Cancelled -- game left running."
 }
 
+# Capture the game's original launch command line BEFORE closing it. r2modman
+# launches the exe with --mod-dir/--pak-dir/--cfg-dir, which the shimloader
+# reads to activate the profile; relaunching the bare exe drops them and the
+# game comes up vanilla (reported 2026-10-14). Replay the exact command line.
+$relaunchExe = $GameExe
+$relaunchArgs = $null
+try {
+    $cmdline = (Get-CimInstance Win32_Process -Filter "ProcessId = $GamePid" -ErrorAction Stop).CommandLine
+    if ($cmdline -match '^\s*"([^"]+)"\s*(.*)$') {
+        $relaunchExe = $matches[1]; $relaunchArgs = $matches[2].Trim()
+    } elseif ($cmdline -match '^\s*(\S+)\s*(.*)$') {
+        $relaunchExe = $matches[1]; $relaunchArgs = $matches[2].Trim()
+    }
+} catch { }
+if (-not $relaunchArgs) {
+    # Fallback: the shimloader publishes its resolved paths into the process
+    # environment (set before ue4ss.dll loads); this script inherits them.
+    $flagParts = @()
+    foreach ($p in @(@("--mod-dir", $env:SHIMLOADER_MOD_DIR),
+                     @("--pak-dir", $env:SHIMLOADER_PAK_DIR),
+                     @("--cfg-dir", $env:SHIMLOADER_CFG_DIR),
+                     @("--overlay-dir", $env:SHIMLOADER_OVERLAY_DIR))) {
+        if ($p[1] -and (Test-Path -LiteralPath $p[1])) { $flagParts += $p[0]; $flagParts += ('"' + $p[1] + '"') }
+    }
+    if ($flagParts.Count -gt 0) { $relaunchArgs = ($flagParts -join ' ') }
+}
+
 Write-Host "Closing the game..."
 $proc = $null
 if ($GamePid -ne 0) { $proc = Get-Process -Id $GamePid -ErrorAction SilentlyContinue }
@@ -164,6 +191,11 @@ Write-Host "Installed."
 
 # --- relaunch ---------------------------------------------------------------
 Write-Host "Relaunching the game..."
-Start-Process -FilePath $GameExe -WorkingDirectory (Split-Path $GameExe)
+if ($relaunchArgs) {
+    Start-Process -FilePath $relaunchExe -ArgumentList $relaunchArgs -WorkingDirectory (Split-Path $relaunchExe)
+} else {
+    Write-Host "(original launch args not found -- relaunching bare; the game may come up without the mod profile)"
+    Start-Process -FilePath $GameExe -WorkingDirectory (Split-Path $GameExe)
+}
 Write-Host "Done."
 Start-Sleep -Seconds 2
