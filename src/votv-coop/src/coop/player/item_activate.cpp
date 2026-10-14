@@ -108,10 +108,14 @@ coop::net::ItemActivatePayload g_lastRxPayload[coop::players::kMaxPeers] = {};
 
 inline constexpr uint64_t kReassertIntervalMs = 2000;
 uint64_t g_lastReassertMs = 0;
-// The local light's re-assert is edge-triggered (one fix per disagreement episode) so it can
-// never fight the game's own BP every interval if the game legitimately keeps the light off
-// while the bool is on.
-bool g_localLightDisagreed = false;
+// NOTE (2026-10-14 playtest): there used to be a local-light re-assert here, driving the
+// player's own light_R to the latched on-intensity when the bool said ON but the light read
+// off. The log proved it fired six times in two minutes and the beam went from the game's
+// normal brightness to blinding: the 5.0 fallback/latch is brighter than the game's intended
+// value, and the game kept returning the light to dim (battery drain at 16%) while the bool
+// stayed ON, so the "repair" fought the game every interval. The game's BP owns the local
+// light; the mod no longer touches it. The re-assert below covers only puppets (received
+// state), which is what the 2026-10-13 observation was about.
 
 bool ProbeLogEnabled() {
     // Read once per process: the observer is hot.
@@ -633,42 +637,6 @@ void TickReassert() {
                 snap.visible ? 1 : 0, snap.intensity, want.state, want.intensity);
         ApplyToPuppet(puppet, want, peer);
     }
-
-    // The local light: the game's BP owns it, so this only ever repairs, never fights -- one
-    // fix per disagreement episode (edge-triggered), and only when the bool says ON with a
-    // real flashlight equipped (the crank lantern drives its own components, not light_R).
-    void* mp = reg.Local();
-    if (mp && R::IsLive(mp)) {
-        ue_wrap::engine::MainPlayerFlashlightState fl{};
-        if (ue_wrap::engine::ReadMainPlayerFlashlightState(mp, fl) &&
-            fl.flashlight && fl.hasFlashlight && !fl.crankFlashlight) {
-            void* light_R = ue_wrap::engine::GetMainPlayerLightR(mp);
-            ue_wrap::engine::FlashlightSnapshot snap{};
-            const bool snapOk =
-                light_R && ue_wrap::engine::ReadFlashlightSnapshot(light_R, snap);
-            if (!light_R || !snapOk) {
-                g_localLightDisagreed = false;  // nothing to drive; do not wedge the flag
-            } else {
-                const bool agrees = snap.visible && snap.intensity > 1.f;
-                if (!agrees && !g_localLightDisagreed) {
-                    float target = g_latchedOnIntensity.load(std::memory_order_acquire);
-                    if (target == 0.f) target = kIntensityOnFallback;
-                    g_echoSuppress.store(true, std::memory_order_release);
-                    ue_wrap::engine::SetSceneComponentVisibility(light_R, true, false);
-                    ue_wrap::engine::SetLightIntensity(light_R, target);
-                    g_echoSuppress.store(false, std::memory_order_release);
-                    g_localLightDisagreed = true;
-                    UE_LOGI("flashlight: REASSERT local light (hypothesis: the game clobbered "
-                            "it) -- bool=ON but light_R=%p read off, drove Intensity=%.2f",
-                            light_R, target);
-                } else if (agrees) {
-                    g_localLightDisagreed = false;
-                }
-            }
-        } else {
-            g_localLightDisagreed = false;
-        }
-    }
 }
 
 void TickConnect() {
@@ -706,7 +674,6 @@ void OnDisconnect() {
         g_lastRxValid[i] = false;
         g_lastRxPayload[i] = {};
     }
-    g_localLightDisagreed = false;
     if (clearedApplies > 0) {
         UE_LOGI("flashlight: OnDisconnect cleared %d pending apply slot(s)",
                 clearedApplies);
