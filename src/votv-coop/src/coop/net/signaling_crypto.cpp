@@ -150,16 +150,22 @@ void fe_carry(Fe& h) {
         h.v[i] = sum & kMask51;
         carry = sum >> 51;
     }
+    // A carry off the top is 2^255 == 19 (mod p): fold it back. One fold
+    // suffices for every caller -- after it the value is < 2^255 + 19, and a
+    // second 2^255 carry would need value >= 2^256 (fe_add's input is < 2p;
+    // fe_frombytes/fe_tobytes never produce a top carry at all).
+    uint64_t c = 19 * carry;  // carry is 0 or 1 here
+    for (int i = 0; i < 5 && c; i++) {
+        const uint64_t sum = h.v[i] + c;
+        h.v[i] = sum & kMask51;
+        c = sum >> 51;
+    }
 }
 
-void fe_add(Fe& h, const Fe& a, const Fe& b) {  // a, b < p
-    uint64_t carry = 0;
-    for (int i = 0; i < 5; i++) {
-        const uint64_t sum = a.v[i] + b.v[i] + carry;
-        h.v[i] = sum & kMask51;
-        carry = sum >> 51;
-    }
-    fe_sub_p_cond(h);  // < 2p
+void fe_add(Fe& h, const Fe& a, const Fe& b) {  // a, b < p; h < p
+    for (int i = 0; i < 5; i++) h.v[i] = a.v[i] + b.v[i];
+    fe_carry(h);      // folds a 2^255 carry; h < 2^255 + 19
+    fe_sub_p_cond(h); // h < p
 }
 
 void fe_sub(Fe& h, const Fe& a, const Fe& b) {  // a, b < p
@@ -263,36 +269,52 @@ bool fe_iszero(const Fe& a) {
 // z^(2^255 - 21) = z^(p-2): the donna addition chain.
 void fe_inv(Fe& out, const Fe& z) {
     Fe t0, t1;
+    Fe s11, s1023, s80, s90, s160;  // saved powers for the chain below
     auto sq = [](Fe& h, const Fe& a, int n) {
         for (int i = 0; i < n; i++) fe_sq(h, i == 0 ? a : h);
     };
-    fe_sq(t0, z);        // 2^1
-    fe_sq(t1, t0);        // 2^2
-    sq(t1, t1, 1);        // 2^3
-    fe_mul(t1, z, t1);    // 2^3 - 2^0
-    fe_mul(t0, t0, t1);   // 2^4 - 2^0
-    fe_sq(t0, t0);        // 2^5 - 2^1
-    fe_mul(t1, t1, t0);   // 2^5 - 2^0
+    // z^11 and z^31 = z^(2^5-1), the seed of the doubling chain.
+    fe_sq(t0, z);        // 2
+    fe_sq(t1, t0);       // 4
+    sq(t1, t1, 1);       // 8
+    fe_mul(t1, z, t1);   // 9
+    fe_mul(t0, t0, t1);  // 11
+    s11 = t0;            // z^11, for the final step
+    fe_sq(t0, t0);       // 22
+    fe_mul(t1, t1, t0);  // 31 = 2^5-1
+    // Doubling step: from z^(2^n-1), square to z^(2^(n+1)-2), square (n-1) more
+    // times to z^(2^2n-2^n), multiply by z^(2^n-1) to reach z^(2^2n-1).
     sq(t0, t1, 1);
-    sq(t0, t0, 4);        // 2^10 - 2^5
-    fe_mul(t1, t1, t0);   // 2^10 - 2^0
+    sq(t0, t0, 4);       // 2^10-2^5
+    fe_mul(t1, t1, t0);  // 2^10-1
+    s1023 = t1;          // z^(2^10-1), for the 2^90-1 step
     sq(t0, t1, 1);
-    sq(t0, t0, 9);        // 2^20 - 2^10
-    fe_mul(t1, t1, t0);   // 2^20 - 2^0
+    sq(t0, t0, 9);       // 2^20-2^10
+    fe_mul(t1, t1, t0);  // 2^20-1
     sq(t0, t1, 1);
-    sq(t0, t0, 19);       // 2^40 - 2^20
-    fe_mul(t1, t1, t0);   // 2^40 - 2^0
+    sq(t0, t0, 19);      // 2^40-2^20
+    fe_mul(t1, t1, t0);  // 2^40-1
     sq(t0, t1, 1);
-    sq(t0, t0, 39);       // 2^80 - 2^40
-    fe_mul(t1, t1, t0);   // 2^80 - 2^0
-    sq(t0, t1, 1);
-    sq(t0, t0, 79);       // 2^160 - 2^80
-    fe_mul(t1, t1, t0);   // 2^160 - 2^0
-    sq(t0, t1, 1);
-    sq(t0, t0, 89);       // 2^250 - 2^90
-    fe_mul(t1, t1, t0);   // 2^250 - 2^0
-    sq(t0, t1, 5);        // 2^255 - 2^5
-    fe_mul(out, t0, z);   // 2^255 - 21
+    sq(t0, t0, 39);      // 2^80-2^40
+    fe_mul(t1, t1, t0);  // 2^80-1
+    s80 = t1;            // z^(2^80-1), for the 2^160-1 step
+    // 2^90-1 = (2^80-1)^1024 * (2^10-1).
+    sq(t0, s80, 1);      // 2^81-2
+    sq(t0, t0, 9);       // 2^90-2^10
+    fe_mul(t1, t0, s1023);  // 2^90-1
+    s90 = t1;            // z^(2^90-1), for the 2^250-1 step
+    // 2^160-1 = (2^80-1)^2^80 * (2^80-1).
+    sq(t0, s80, 1);      // 2^81-2
+    sq(t0, t0, 79);      // 2^160-2^80
+    fe_mul(t1, s80, t0); // 2^160-1
+    s160 = t1;           // z^(2^160-1), for the 2^250-1 step
+    // 2^250-1 = (2^160-1)^2^90 * (2^90-1).
+    sq(t0, s160, 1);     // 2^161-2
+    sq(t0, t0, 89);      // 2^250-2^90
+    fe_mul(t1, t0, s90); // 2^250-1
+    // 2^255-21 = 32*(2^250-1) + 11.
+    sq(t0, t1, 5);       // 2^255-32
+    fe_mul(out, t0, s11);  // 2^255-21
 }
 
 // Load 32 little-endian bytes; bit 255 (the Ed25519 sign bit position) is folded via
@@ -300,7 +322,9 @@ void fe_inv(Fe& out, const Fe& z) {
 void fe_frombytes(Fe& h, const uint8_t s[32]) {
     uint8_t t[32];
     std::memcpy(t, s, 32);
-    const uint64_t top = (t[31] >> 7) & 1u;
+    // RFC 7748 section 5: the u-coordinate's high bit is masked off, not folded.
+    // (Folding it as 2^255 == 19 gives a different field element and fails the
+    // section 5.2 vector 2, whose u has the high bit set.)
     t[31] &= 0x7f;
     uint64_t acc = 0;
     int accbits = 0, limb = 0;
@@ -313,8 +337,8 @@ void fe_frombytes(Fe& h, const uint8_t s[32]) {
             accbits -= 51;
         }
     }
-    h.v[limb] = acc;  // the last 51 bits
-    h.v[0] += 19 * top;
+    // All 255 bits are in h.v[0..4] now (5x51); acc holds only the masked-off
+    // top bit (0). There is no sixth limb.
     fe_carry(h);
     fe_sub_p_cond(h);
 }
@@ -579,11 +603,11 @@ void p1305_blocks(P1305& h, const uint32_t r[4], const uint8_t* m, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// AEAD_CHACHA20_POLY1305 (RFC 8439 section 2.8), empty AAD.
+// AEAD_CHACHA20_POLY1305 (RFC 8439 section 2.8).
 // ---------------------------------------------------------------------------
 
-void AeadMac(const uint8_t key[32], const uint8_t nonce[12], const uint8_t* ct, size_t ctLen,
-             uint8_t tag[16]) {
+void AeadMac(const uint8_t key[32], const uint8_t nonce[12], const uint8_t* aad, size_t aadLen,
+             const uint8_t* ct, size_t ctLen, uint8_t tag[16]) {
     uint8_t block0[64];
     ChaChaBlock(key, 0, nonce, block0);
     uint32_t r[4], s[4];
@@ -596,12 +620,18 @@ void AeadMac(const uint8_t key[32], const uint8_t nonce[12], const uint8_t* ct, 
     r[2] &= 0x0ffffffcu;
     r[3] &= 0x0ffffffcu;
 
-    // mac_data = ct || pad16(ct) || le64(0) || le64(ctLen): AAD is empty.
+    // mac_data = aad || pad16(aad) || ct || pad16(ct) || le64(aadLen) || le64(ctLen).
     std::vector<uint8_t> mac;
-    mac.reserve(ctLen + 32);
+    mac.reserve(aadLen + ctLen + 32);
+    if (aadLen > 0) mac.insert(mac.end(), aad, aad + aadLen);
+    while (mac.size() % 16 != 0) mac.push_back(0);
     mac.insert(mac.end(), ct, ct + ctLen);
     while (mac.size() % 16 != 0) mac.push_back(0);
-    for (int i = 0; i < 8; i++) mac.push_back(0);  // le64(len(aad) = 0)
+    uint64_t al = aadLen;
+    for (int i = 0; i < 8; i++) {
+        mac.push_back((uint8_t)al);
+        al >>= 8;
+    }
     uint64_t l = ctLen;
     for (int i = 0; i < 8; i++) {
         mac.push_back((uint8_t)l);
@@ -621,8 +651,8 @@ void AeadMac(const uint8_t key[32], const uint8_t nonce[12], const uint8_t* ct, 
     SecureZero(block0, sizeof block0);
 }
 
-bool AeadSeal(const uint8_t key[32], const uint8_t nonce[12], const uint8_t* pt, size_t ptLen,
-              std::string& ctTagOut) {
+bool AeadSeal(const uint8_t key[32], const uint8_t nonce[12], const uint8_t* aad, size_t aadLen,
+              const uint8_t* pt, size_t ptLen, std::string& ctTagOut) {
     ctTagOut.assign(ptLen + 16, '\0');
     uint8_t* ct = reinterpret_cast<uint8_t*>(&ctTagOut[0]);
     uint32_t counter = 1;
@@ -636,19 +666,19 @@ bool AeadSeal(const uint8_t key[32], const uint8_t nonce[12], const uint8_t* pt,
         off += bl;
     }
     uint8_t tag[16];
-    AeadMac(key, nonce, ct, ptLen, tag);
+    AeadMac(key, nonce, aad, aadLen, ct, ptLen, tag);
     std::memcpy(ct + ptLen, tag, 16);
     SecureZero(tag, sizeof tag);
     return true;
 }
 
-bool AeadOpen(const uint8_t key[32], const uint8_t nonce[12], const uint8_t* ct, size_t ctLen,
-              std::string& ptOut) {
+bool AeadOpen(const uint8_t key[32], const uint8_t nonce[12], const uint8_t* aad, size_t aadLen,
+              const uint8_t* ct, size_t ctLen, std::string& ptOut) {
     if (ctLen < 16) return false;
     const size_t bodyLen = ctLen - 16;
     const uint8_t* tag = ct + bodyLen;
     uint8_t expect[16];
-    AeadMac(key, nonce, ct, bodyLen, expect);
+    AeadMac(key, nonce, aad, aadLen, ct, bodyLen, expect);
     // Constant-time compare: the RFC mandates it, and it costs nothing here.
     uint8_t diff = 0;
     for (int i = 0; i < 16; i++) diff |= expect[i] ^ tag[i];
@@ -745,7 +775,7 @@ bool Seal(const SessionKey& key, const uint8_t* pt, size_t ptLen, std::string& e
     uint8_t nonce[kNonceLen];
     if (!peer_identity::RandomBytes(nonce, sizeof nonce)) return false;
     std::string ctTag;
-    AeadSeal(key.bytes, nonce, pt, ptLen, ctTag);
+    AeadSeal(key.bytes, nonce, nullptr, 0, pt, ptLen, ctTag);
     envelopeOut.clear();
     envelopeOut.reserve(kHeaderLen + kNonceLen + ctTag.size());
     envelopeOut.push_back(kMagic0);
@@ -767,7 +797,7 @@ bool Open(const SessionKey& key, const uint8_t* env, size_t envLen, std::string&
     const uint8_t* nonce = env + kHeaderLen;
     const uint8_t* ct = env + kHeaderLen + kNonceLen;
     const size_t ctLen = envLen - kHeaderLen - kNonceLen;
-    return AeadOpen(key.bytes, nonce, ct, ctLen, ptOut);
+    return AeadOpen(key.bytes, nonce, nullptr, 0, ct, ctLen, ptOut);
 }
 
 // ---------------------------------------------------------------------------
@@ -783,11 +813,12 @@ bool FromHex(const char* hex, uint8_t* out, size_t n) {
         if ('A' <= c && c <= 'F') return c - 'A' + 10;
         return -1;
     };
-    for (size_t i = 0; i < n; i++) {
-        const int hi = nib(hex[2 * i]), lo = nib(hex[2 * i + 1]);
-        if (hi < 0 || lo < 0) return false;
-        out[i] = (uint8_t)((hi << 4) | lo);
-    }
+    // The string must hold exactly 2*n hex chars; a short literal would otherwise
+    // read out of bounds (caught by ASan on the Poly1305 selftest vector).
+    for (size_t i = 0; i < 2 * n; i++)
+        if (nib(hex[i]) < 0) return false;
+    for (size_t i = 0; i < n; i++)
+        out[i] = (uint8_t)((nib(hex[2 * i]) << 4) | nib(hex[2 * i + 1]));
     return true;
 }
 
@@ -826,7 +857,7 @@ bool RunSelftest() {
     }
 
     // 2-3: X25519 against the two RFC 7748 section 5.2 vectors. Vector 2's u-coordinate has
-    // its high bit set, which is what pins the no-masking decode.
+    // its high bit set, which pins the masking decode (the bit is cleared, not folded).
     {
         uint8_t scalar[32], u[32], out[32];
         check(FromHex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
@@ -924,7 +955,7 @@ bool RunSelftest() {
     {
         uint8_t key[32], tag[16];
         const char* msg = "Cryptographic Forum Research Group";
-        check(FromHex("85d6be4557ea1fe11fd6e6f6d5d787f85d6be4557ea1fe11fd6e6f6d5d787f",
+        check(FromHex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b",
                       key, 32),
               "selftest vector failed to parse");
         uint32_t r[4], s[4];
@@ -951,17 +982,19 @@ bool RunSelftest() {
 
     // 10-11: AEAD_CHACHA20_POLY1305 against the RFC 8439 section 2.8.2 vector (pins the
     // ChaCha20 block function and the composition at once), plus a tampered tag refusing.
+    // The vector uses 12 bytes of AAD, so this also pins the AAD path.
     {
-        uint8_t key[32], nonce[12];
+        uint8_t key[32], nonce[12], aad[12];
         const char* pt =
             "Ladies and Gentlemen of the class of '99: If I could offer you only one tip "
             "for the future, sunscreen would be it.";
         check(FromHex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
                       key, 32) &&
-                  FromHex("070000004041424344454647", nonce, 12),
+                  FromHex("070000004041424344454647", nonce, 12) &&
+                  FromHex("50515253c0c1c2c3c4c5c6c7", aad, 12),
               "selftest vector failed to parse");
         std::string ctTag;
-        AeadSeal(key, nonce, reinterpret_cast<const uint8_t*>(pt), 114, ctTag);
+        AeadSeal(key, nonce, aad, sizeof aad, reinterpret_cast<const uint8_t*>(pt), 114, ctTag);
         check(ctTag.size() == 114 + 16 &&
                   HexEq(reinterpret_cast<const uint8_t*>(ctTag.data()),
                         "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6"
@@ -974,12 +1007,14 @@ bool RunSelftest() {
                     "1ae10b594f09e26a7e902ecbd0600691", 16),
               "ChaCha20-Poly1305 tag != RFC 8439 section 2.8.2");
         std::string back;
-        check(AeadOpen(key, nonce, reinterpret_cast<const uint8_t*>(ctTag.data()),
+        check(AeadOpen(key, nonce, aad, sizeof aad,
+                       reinterpret_cast<const uint8_t*>(ctTag.data()),
                        ctTag.size(), back) &&
                   back.size() == 114 && std::memcmp(back.data(), pt, 114) == 0,
               "ChaCha20-Poly1305 did not round-trip its own output");
         ctTag[ctTag.size() - 1] ^= 0x01;
-        check(!AeadOpen(key, nonce, reinterpret_cast<const uint8_t*>(ctTag.data()),
+        check(!AeadOpen(key, nonce, aad, sizeof aad,
+                        reinterpret_cast<const uint8_t*>(ctTag.data()),
                         ctTag.size(), back),
               "ChaCha20-Poly1305 ACCEPTED a tampered tag");
     }
