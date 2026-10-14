@@ -169,7 +169,7 @@ bool OnImpactDamageCppPre(void* self, void* params) {
         float ix = ivx, iy = ivy, iz = ivz;
         float len = std::sqrt(ix*ix + iy*iy + iz*iz);
         if (!(len > 1e-3f)) {
-            E::FVector hitterPos{}, puppetPos{};
+            ue_wrap::FVector hitterPos{}, puppetPos{};
             if (E::TryGetActorLocation(hitActor, hitterPos) && E::TryGetActorLocation(self, puppetPos)) {
                 ix = puppetPos.X - hitterPos.X;
                 iy = puppetPos.Y - hitterPos.Y;
