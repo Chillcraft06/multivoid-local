@@ -90,8 +90,12 @@ if ($localSha -and ($localSha -eq $remoteSha)) {
 }
 
 # --- download ------------------------------------------------------------
-$asset = @($release.assets | Where-Object { $_.name -like "*.zip" })[0]
-if (-not $asset) { Pause-Exit "The latest release has no zip asset." }
+# The release carries two zips: the mod zip and the r2modman profile zip.
+# The updater wants the mod zip. Pick it by name, not by position: the
+# profile zip sorts first alphabetically and a blind [0] would download it,
+# then abort at the mod/ layout check.
+$asset = @($release.assets | Where-Object { $_.name -like "Pelmentor-Multivoid-*.zip" -and $_.name -notlike "*profile*" })[0]
+if (-not $asset) { Pause-Exit "The latest release has no mod zip asset." }
 
 $zipPath = Join-Path $env:TEMP "multivoid-update.zip"
 Write-Host ""
