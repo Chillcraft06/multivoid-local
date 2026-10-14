@@ -12,7 +12,9 @@
 #include "coop/net/protocol.h"
 #include "coop/net/session.h"
 #include "coop/player/players_registry.h"
+#include "coop/player/remote_player.h"
 #include "ue_wrap/engine/engine.h"
+#include "ue_wrap/core/call.h"
 #include "ue_wrap/core/game_thread.h"
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/core/object_index.h"
@@ -38,6 +40,30 @@ std::atomic<coop::net::Session*> g_session{nullptr};  // read in the impact inte
 constexpr float kMaxDamagePerHit = 1000.f;
 
 bool ValidDamage(float d) { return std::isfinite(d) && d > 0.f && d <= kMaxDamagePerHit; }
+
+// Forward: defined below; called by OnImpactDamageCppPre.
+void SendPlayerDamageWithImpulse(int ownerSlot, float damage, float ix, float iy, float iz);
+
+// Mass tier boundary for prop-vs-puppet impacts (kg). From Jordan's 2026-10-14 tutorial-level
+// mass dump: hand items (drives, tools, crowbar, reelbox) top out at 20.5 kg; the next heaviest
+// is a 37.4 kg cardboard box, then 84+ kg furniture. 30 kg sits in the gap. Below: the prop just
+// blocks (current behavior, no relay). At/above: knock over + damage via the owner relay.
+constexpr float kHeavyPropMassKg = 30.0f;
+
+// Knock-over tuning: shove velocity = mass * kKnockVelPerKg, clamped. A 100 kg trash can gives
+// 800 cm/s (a solid shove; walk speed is ~500). Direction comes from the game's impact vector.
+constexpr float kKnockVelPerKg = 8.0f;
+constexpr float kKnockVelMin = 200.0f;
+constexpr float kKnockVelMax = 1200.0f;
+
+// impactDamageCPP param frame offsets, from the 2026-10-14 shimloader object dump
+// (Jordan's 70MB dump, /Game/main/mainPlayer.mainPlayer_C:impactDamageCPP):
+//   Damage : FloatProperty  [o: 0]
+//   Hit    : StructProperty [o: 4]  (FHitResult, unread)
+//   Actor  : ObjectProperty [o: 90] (the hitting actor)
+//   impact : StructProperty [o: 98] (FVector, the impact vector)
+constexpr int kImpactDamageCpp_ActorOffset = 90;
+constexpr int kImpactDamageCpp_ImpactOffset = 98;
 
 // The impact-entry cancel. mainPlayer_C's three native->BP impact events, one shared PRE callback
 // registered once for each. The class is loaded at the main menu and lives for the process
@@ -78,6 +104,95 @@ bool OnImpactEntryPre(void* self, void* /*params*/) {
     return true;  // cancel: the singleton saveSlot write must not run for a foreign body
 }
 
+// Find the peer slot whose puppet actor is `puppetActor`. Returns -1 if none.
+int SlotForPuppetActor(void* puppetActor) {
+    auto& reg = coop::players::Registry::Get();
+    for (uint8_t slot = 1; slot < coop::players::kMaxPeers; ++slot) {
+        coop::RemotePlayer* pup = reg.Puppet(slot);
+        if (pup && pup->GetActor() == puppetActor) return static_cast<int>(slot);
+    }
+    return -1;
+}
+
+// impactDamageCPP-only PRE: the mass-tier dispatcher. Reads the hitting Actor and impact vector
+// from the raw params (offsets from Jordan's dump, see above). The interceptor can run on any
+// thread, so it only reads the params and cancels; the mass check and relay are posted to the
+// game thread (GetActorRootMass uses ProcessEvent; the registry is game-thread-only).
+//   - mass < kHeavyPropMassKg: light prop (thrown drive etc.) -- cancel, block, no relay.
+//   - mass >= kHeavyPropMassKg: heavy prop (dragged furniture etc.) -- cancel the local body AND
+//     relay damage + knock impulse to the puppet's owner, who applies both to their real player.
+// Always cancels for non-local bodies (the singleton-saveSlot guard); the tier only decides
+// whether the owner gets a relay.
+bool OnImpactDamageCppPre(void* self, void* params) {
+    auto* s = g_session.load(std::memory_order_acquire);
+    if (!s || !s->connected()) return false;
+    if (!self || !params) return false;
+    void* localPawn = g_localPawn.load(std::memory_order_acquire);
+    if (!localPawn) return false;
+    if (self == localPawn) return false;    // own body: native path
+
+    const uint8_t* bytes = static_cast<const uint8_t*>(params);
+    void* hitActor = *reinterpret_cast<void* const*>(bytes + kImpactDamageCpp_ActorOffset);
+    const float* impactVec = reinterpret_cast<const float*>(bytes + kImpactDamageCpp_ImpactOffset);
+    const float damage = *reinterpret_cast<const float*>(bytes);  // offset 0
+    const float ivx = impactVec[0], ivy = impactVec[1], ivz = impactVec[2];
+
+    const uint32_t n = ++g_canceled;
+    if (!hitActor) {
+        if (n <= 5 || (n % 50) == 0) {
+            UE_LOGI("player_damage: canceled impactDamageCPP on non-local body %p (#%u) -- no hitting actor",
+                    self, n);
+        }
+        return true;
+    }
+
+    // Game thread: mass check, tier decision, and the heavy-tier relay.
+    GT::Post([self, hitActor, damage, ivx, ivy, ivz, n] {
+        if (!R::IsLive(hitActor) || !R::IsLive(self)) return;
+        const float mass = E::GetActorRootMass(hitActor);
+        if (!(mass >= kHeavyPropMassKg)) {
+            // Light tier: block only. Thrown drives, floppies, food -- they bounce off.
+            if (n <= 5 || (n % 50) == 0) {
+                UE_LOGI("player_damage: light prop hit puppet (mass=%.1f kg < %.0f) -- blocked, no relay (#%u)",
+                        mass, kHeavyPropMassKg, n);
+            }
+            return;
+        }
+        // Heavy tier: knock over + damage. Relay to the owner.
+        const int ownerSlot = SlotForPuppetActor(self);
+        if (ownerSlot < 0) {
+            UE_LOGW("player_damage: heavy prop hit (mass=%.1f kg) but no owner slot for puppet %p -- blocked, no relay",
+                    mass, self);
+            return;
+        }
+        // Knock direction: the game's impact vector, normalized; fall back to away-from-hitter.
+        float ix = ivx, iy = ivy, iz = ivz;
+        float len = std::sqrt(ix*ix + iy*iy + iz*iz);
+        if (!(len > 1e-3f)) {
+            E::FVector hitterPos{}, puppetPos{};
+            if (E::TryGetActorLocation(hitActor, hitterPos) && E::TryGetActorLocation(self, puppetPos)) {
+                ix = puppetPos.X - hitterPos.X;
+                iy = puppetPos.Y - hitterPos.Y;
+                iz = 0.f;
+                len = std::sqrt(ix*ix + iy*iy);
+            }
+        }
+        float kx = 0.f, ky = 0.f, kz = 0.f;
+        if (len > 1e-3f) {
+            float speed = mass * kKnockVelPerKg;
+            if (speed < kKnockVelMin) speed = kKnockVelMin;
+            if (speed > kKnockVelMax) speed = kKnockVelMax;
+            kx = ix / len * speed;
+            ky = iy / len * speed;
+            kz = iz / len * speed;
+        }
+        UE_LOGI("player_damage: HEAVY prop hit puppet (mass=%.1f kg >= %.0f) -- relaying damage=%.1f + knock=(%.0f,%.0f,%.0f) to slot %d",
+                mass, kHeavyPropMassKg, damage, kx, ky, kz, ownerSlot);
+        SendPlayerDamageWithImpulse(ownerSlot, damage, kx, ky, kz);
+    });
+    return true;  // cancel the local body synchronously; the owner applies it to the real player
+}
+
 }  // namespace
 
 void Install(coop::net::Session* session) {
@@ -98,7 +213,10 @@ void Tick() {
     bool all = true;
     for (int i = 0; i < 3; ++i) {
         g_impactFns[i] = R::FindFunction(cls, kImpactEntryNames[i]);
-        if (g_impactFns[i] && GT::RegisterInterceptor(g_impactFns[i], &OnImpactEntryPre)) continue;
+        // impactDamageCPP gets the mass-tier dispatcher (reads the hitting Actor from the params);
+        // the other entries keep the plain non-local-body cancel.
+        auto* cb = (i == 1) ? &OnImpactDamageCppPre : &OnImpactEntryPre;
+        if (g_impactFns[i] && GT::RegisterInterceptor(g_impactFns[i], cb)) continue;
         all = false;
         UE_LOGE("player_damage: impact entry %ls %s -- a non-local body runs its damage body", kImpactEntryNames[i],
                 g_impactFns[i] ? "did not register (the interceptor table is full)"
@@ -119,7 +237,9 @@ void OnWireDamage(const coop::net::PlayerDamagePayload& p) {
     }
     const uint32_t targetEid = p.targetElementId;
     const float damage = p.damage;
-    GT::Post([targetEid, damage] {
+    const float ix = p.impulseX, iy = p.impulseY, iz = p.impulseZ;
+    const bool hasKnock = (ix != 0.f || iy != 0.f || iz != 0.f);
+    GT::Post([targetEid, damage, ix, iy, iz, hasKnock] {
         auto& reg = coop::players::Registry::Get();
         const coop::element::ElementId localEid = reg.LocalPlayerElementId();
         // Defense-in-depth: PlayerDamage is sent point-to-point to our slot, so it IS
@@ -156,37 +276,70 @@ void OnWireDamage(const coop::net::PlayerDamagePayload& p) {
                 "saveSlot.health %.2f -> %.2f blood=%d [mp possessed=%d isPuppet=%d]",
                 damage, targetEid, ok ? 1 : 0, before, after, wasAlive ? 1 : 0,
                 possessed ? 1 : 0, isPup ? 1 : 0);
+        // Heavy-prop knock-over: launch the character along the relayed impulse. This is the
+        // owner's REAL player (not a puppet), so the game's own Character movement handles it.
+        if (hasKnock && wasAlive) {
+            void* charClass = R::FindClass(L"Character");
+            void* launchFn = charClass ? R::FindFunction(charClass, L"LaunchCharacter") : nullptr;
+            if (launchFn) {
+                ue_wrap::ParamFrame frame(launchFn);
+                if (frame.valid()) {
+                    // LaunchVelocity is an FVector at offset 0; set the three floats directly.
+                    float vel[3] = { ix, iy, iz };
+                    frame.SetRaw(L"LaunchVelocity", vel, sizeof(vel));
+                    const bool xy = true, z = true;
+                    frame.Set(L"bXYOverride", xy);
+                    frame.Set(L"bZOverride", z);
+                    if (ue_wrap::Call(mp, frame)) {
+                        UE_LOGI("player_damage: knock-over LaunchCharacter(%.0f,%.0f,%.0f) on own player",
+                                ix, iy, iz);
+                    } else {
+                        UE_LOGW("player_damage: LaunchCharacter call failed");
+                    }
+                }
+            } else {
+                UE_LOGW("player_damage: knock-over impulse (%.0f,%.0f,%.0f) but LaunchCharacter not found",
+                        ix, iy, iz);
+            }
+        }
     });
 }
 
-void SendPlayerDamage(int ownerSlot, float damage) {
+void SendPlayerDamageWithImpulse(int ownerSlot, float damage, float ix, float iy, float iz) {
     auto* s = g_session.load(std::memory_order_acquire);
     if (!s) {
-        UE_LOGW("player_damage: SendPlayerDamage but session is unset");
+        UE_LOGW("player_damage: SendPlayerDamageWithImpulse but session is unset");
         return;
     }
     if (ownerSlot <= 0 || ownerSlot >= coop::players::kMaxPeers) {
-        UE_LOGW("player_damage: SendPlayerDamage invalid ownerSlot=%d", ownerSlot);
+        UE_LOGW("player_damage: SendPlayerDamageWithImpulse invalid ownerSlot=%d", ownerSlot);
         return;
     }
     if (!ValidDamage(damage)) {
-        UE_LOGW("player_damage: SendPlayerDamage invalid amount=%.3f", damage);
+        UE_LOGW("player_damage: SendPlayerDamageWithImpulse invalid amount=%.3f", damage);
         return;
     }
     auto& reg = coop::players::Registry::Get();
     coop::element::Player* el = reg.GetPlayerElement(static_cast<uint8_t>(ownerSlot));
     if (!el) {
-        UE_LOGW("player_damage: SendPlayerDamage slot=%d has no Player Element yet -- skipping "
+        UE_LOGW("player_damage: SendPlayerDamageWithImpulse slot=%d has no Player Element yet -- skipping "
                 "(peer not fully identified)", ownerSlot);
         return;
     }
     coop::net::PlayerDamagePayload p{};
     p.targetElementId = el->GetId();
     p.damage = damage;
+    p.impulseX = ix;
+    p.impulseY = iy;
+    p.impulseZ = iz;
     const bool sent = s->SendReliableToSlot(
         ownerSlot, coop::net::ReliableKind::PlayerDamage, &p, sizeof(p), /*senderSlot=*/0);
-    UE_LOGI("player_damage: sent PlayerDamage(%.1f) to slot=%d (targetEid=%u) -> sent=%d",
-            damage, ownerSlot, p.targetElementId, sent ? 1 : 0);
+    UE_LOGI("player_damage: sent PlayerDamage(%.1f, impulse=%.0f,%.0f,%.0f) to slot=%d (targetEid=%u) -> sent=%d",
+            damage, ix, iy, iz, ownerSlot, p.targetElementId, sent ? 1 : 0);
+}
+
+void SendPlayerDamage(int ownerSlot, float damage) {
+    SendPlayerDamageWithImpulse(ownerSlot, damage, 0.f, 0.f, 0.f);
 }
 
 bool DebugForceHitPuppet(int ownerSlot, float damage) {

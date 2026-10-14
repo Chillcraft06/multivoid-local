@@ -2657,13 +2657,19 @@ static_assert(sizeof(ItemActivatePayload) <= 256 - 20 - 8,
 inline constexpr uint8_t kItemActivateFlag_HasActorKey = 0x01;
 
 // A damage relay (PlayerDamage): the owner peer's Player element id, so the receiver verifies it is
-// the addressed peer, and the raw hit amount its own armor mitigates.
+// the addressed peer, and the raw hit amount its own armor mitigates. The impulse is the world-space
+// knock vector for heavy prop hits (mass >= kHeavyPropMassKg); it is (0,0,0) for enemy hits, which
+// carry no knock-over. The owner applies it via LaunchCharacter after the damage lands.
+// 4 + 4 + 12 = 20 bytes.
 struct PlayerDamagePayload {
     uint32_t targetElementId;  // the OWNER peer's Player Element id (host-stamped)
     float    damage;           // raw hit amount; owner BP mitigates per its inventory
+    float    impulseX;         // world-space knock vector X (0 when no knock-over)
+    float    impulseY;         // world-space knock vector Y (0 when no knock-over)
+    float    impulseZ;         // world-space knock vector Z (0 when no knock-over)
 };
-static_assert(sizeof(PlayerDamagePayload) == 8,
-              "PlayerDamagePayload must be exactly 8 bytes");
+static_assert(sizeof(PlayerDamagePayload) == 20,
+              "PlayerDamagePayload must be exactly 20 bytes");
 static_assert(sizeof(PlayerDamagePayload) <= 256 - 20 - 8,
               "PlayerDamagePayload must fit in one reliable datagram");
 

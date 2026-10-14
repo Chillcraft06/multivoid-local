@@ -33,6 +33,11 @@ void OnWireDamage(const coop::net::PlayerDamagePayload& p);
 // Player Element, or the amount non-finite or out of range. Game thread.
 void SendPlayerDamage(int ownerSlot, float damage);
 
+// Host side: SendPlayerDamage plus a world-space knock impulse (cm/s) for heavy prop hits.
+// The owner applies the impulse via LaunchCharacter after the damage lands. A zero impulse
+// means no knock-over (enemy hits). Game thread.
+void SendPlayerDamageWithImpulse(int ownerSlot, float damage, float ix, float iy, float iz);
+
 // Test entry (host): confirm slot `ownerSlot` has a puppet, then SendPlayerDamage; true if a send
 // was attempted. Drives the relay without an enemy. Game thread.
 bool DebugForceHitPuppet(int ownerSlot, float damage);
