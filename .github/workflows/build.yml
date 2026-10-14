@@ -91,7 +91,7 @@ jobs:
           SHA="${{ github.sha }}"
           REPO="${{ github.repository }}"
           gh release delete "$TAG" --cleanup-tag -y -R "$REPO" || true
-          gh release create "$TAG" ./dist/*.zip \
+          gh release create "$TAG" ./dist/*.zip ./dist/install-profile.ps1 \
             --title "dev-latest" \
             --prerelease \
             -R "$REPO" \
