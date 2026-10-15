@@ -321,8 +321,12 @@ static void* SpawnPuppetMainPlayer(const FVector& loc,
     // remote players instead of passing through. The puppet is wire-driven via SetActorLocation
     // (not physics-simulated), so it won't be pushed; it just blocks. Players bumping into each
     // other is the point.
+    // The response must be set explicitly: enabling collision without a blocking profile does
+    // nothing, and the spawned puppet's default does not block props/vehicles (2026-10-15
+    // playtest: props and the ATV went right through). Block (2) on all channels.
     E::SetActorRootCollisionEnabled(actor, 3 /*QueryAndPhysics*/);
-    UE_LOGI("puppet[MainPlayer]: enabled root collision (QueryAndPhysics) for player-vs-player hits");
+    E::SetActorRootCollisionResponse(actor, 2 /*Block*/);
+    UE_LOGI("puppet[MainPlayer]: enabled root collision (QueryAndPhysics, BlockAll) for player-vs-player hits");
 
     return actor;
 }
