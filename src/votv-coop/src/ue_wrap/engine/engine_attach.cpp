@@ -37,7 +37,6 @@ void* g_isAwakeFn = nullptr;  // PrimitiveComponent::IsAnyRigidBodyAwake
 void* g_getMatFn  = nullptr;  // PrimitiveComponent::GetMaterial
 void* g_getMassFn = nullptr;  // PrimitiveComponent::GetMass
 void* g_getPhysMatFn = nullptr;  // MaterialInterface::GetPhysicalMaterial
-void* g_setCollRespFn = nullptr;  // PrimitiveComponent::SetCollisionResponseToAllChannels
 void* g_attachCompFn = nullptr;  // Actor::K2_AttachToComponent
 void* g_detachFn     = nullptr;  // Actor::K2_DetachFromActor
 
@@ -275,17 +274,6 @@ int AttachedCharactersOf(void* actor, AttachedCharacter* out, int max) {
         }
     }
     return n;
-}
-
-bool SetActorRootCollisionResponse(void* actor, uint8_t response) {
-    void* root = PrimitiveRootOf(actor);
-    if (!root) return false;
-    void* fn = PrimFn(&g_setCollRespFn, L"SetCollisionResponseToAllChannels");
-    if (!fn) { UE_LOGW("engine: SetCollisionResponseToAllChannels unresolved"); return false; }
-    ParamFrame f(fn);
-    // ECollisionResponse is a uint8 enum: 0 Ignore, 1 Overlap, 2 Block.
-    f.Set<uint8_t>(L"NewResponse", response);
-    return Call(root, f);
 }
 
 }  // namespace ue_wrap::engine

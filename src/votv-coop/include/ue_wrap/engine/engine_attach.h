@@ -46,11 +46,6 @@ bool SetActorRootMovable(void* actor);
 // mirror needs 3 to land.
 bool SetActorRootCollisionEnabled(void* actor, uint8_t collisionType);
 
-// SetCollisionResponseToAllChannels on the root (0 Ignore, 1 Overlap, 2 Block). The profile
-// controls WHICH channels are blocked; enabling collision without a blocking response does
-// nothing. A puppet needs Block (2) or props and the ATV pass through.
-bool SetActorRootCollisionResponse(void* actor, uint8_t response);
-
 // SetNotifyRigidBodyCollision on the root; false keeps the collision but silences the
 // OnComponentHit BP events (a mirror clump's landing handler would spawn a second pile).
 bool SetActorRootNotifyRigidBodyCollision(void* actor, bool notify);
