@@ -70,6 +70,7 @@ const wchar_t* const kImpactEntryNames[3] = {
 };
 void*    g_impactFns[3] = {};
 bool     g_impactInterceptorsDone = false;
+void*    g_atvImpactFn = nullptr;
 uint32_t g_canceled = 0;   // rate-latched log counter
 
 // The LOCAL possessed player, published by Tick (game thread) for the interceptor's any-thread
@@ -190,6 +191,58 @@ bool OnImpactDamageCppPre(void* self, void* params) {
     return true;  // cancel the local body synchronously; the owner applies it to the real player
 }
 
+// ATV impactDamageCPP PRE: the ATV has its own impactDamageCPP (separate from mainPlayer_C).
+// When the ATV hits a puppet, self=ATV, params->Actor=puppet. We check if the hit actor is a
+// puppet, and if so, relay heavy-tier damage+knock to the puppet's owner. The ATV is always
+// heavy (>=30kg), so no mass-tier check needed -- it's always a knock.
+bool OnAtvImpactDamageCppPre(void* self, void* params) {
+    if (!self || !params) return false;
+    const uint8_t* bytes = static_cast<const uint8_t*>(params);
+    void* hitActor = *reinterpret_cast<void* const*>(bytes + kImpactDamageCpp_ActorOffset);
+    const float* impactVec = reinterpret_cast<const float*>(bytes + kImpactDamageCpp_ImpactOffset);
+    const float damage = *reinterpret_cast<const float*>(bytes);
+    const float ivx = impactVec[0], ivy = impactVec[1], ivz = impactVec[2];
+
+    if (!hitActor) return false;  // ATV hit the world, not a puppet -- let it through
+
+    // Game thread: check if the hit actor is a puppet, and relay if so.
+    GT::Post([self, hitActor, damage, ivx, ivy, ivz] {
+        if (!R::IsLive(hitActor) || !R::IsLive(self)) return;
+        const int ownerSlot = SlotForPuppetActor(hitActor);
+        if (ownerSlot < 0) return;  // Not a puppet -- let the ATV's normal impact run
+        // It IS a puppet. The ATV is heavy -- relay damage + knock to the owner.
+        const float mass = E::GetActorRootMass(self);
+        UE_LOGI("player_damage: ATV hit puppet (mass=%.1f kg) -- relaying damage=%.1f to slot %d",
+                mass, damage, ownerSlot);
+        // Knock direction: away from the ATV, using the impact vector or positional fallback.
+        float ix = ivx, iy = ivy, iz = ivz;
+        float len = std::sqrt(ix*ix + iy*iy + iz*iz);
+        if (!(len > 1e-3f)) {
+            ue_wrap::FVector atvPos{}, puppetPos{};
+            if (E::TryGetActorLocation(self, atvPos) && E::TryGetActorLocation(hitActor, puppetPos)) {
+                ix = puppetPos.X - atvPos.X;
+                iy = puppetPos.Y - atvPos.Y;
+                iz = 0.f;
+                len = std::sqrt(ix*ix + iy*iy);
+            }
+        }
+        float kx = 0.f, ky = 0.f, kz = 0.f;
+        if (len > 1e-3f) {
+            // ATV is heavy -- use max knock speed, scaled slightly by mass.
+            float speed = kKnockVelMax;
+            if (mass > 0.f && mass < 500.f) {
+                // Lighter than expected? Scale down proportionally, but keep it punchy.
+                speed = kKnockVelMin + (kKnockVelMax - kKnockVelMin) * (mass / 500.f);
+            }
+            kx = ix / len * speed;
+            ky = iy / len * speed;
+            kz = iz / len * speed;
+        }
+        SendPlayerDamageWithImpulse(ownerSlot, damage, kx, ky, kz);
+    });
+    return true;  // cancel the ATV's local impact body; the owner applies it
+}
+
 }  // namespace
 
 void Install(coop::net::Session* session) {
@@ -224,6 +277,20 @@ void Tick() {
                 "impactDamageCPP=%p impactSquishCPP=%p) -- non-local bodies never run "
                 "the saveSlot damage body",
                 g_impactFns[0], g_impactFns[1], g_impactFns[2]);
+    }
+    // ATV interceptor: the ATV has its own impactDamageCPP. When it hits a puppet,
+    // we relay heavy-tier damage+knock to the puppet's owner.
+    void* atvCls = ue_wrap::object_index::ClassByName(L"ATV_C");
+    if (atvCls) {
+        g_atvImpactFn = R::FindFunction(atvCls, L"impactDamageCPP");
+        if (g_atvImpactFn && GT::RegisterInterceptor(g_atvImpactFn, &OnAtvImpactDamageCppPre)) {
+            UE_LOGI("player_damage: ATV impactDamageCPP interceptor installed (%p) -- ATV hits relay to puppet owners",
+                    g_atvImpactFn);
+        } else {
+            UE_LOGE("player_damage: ATV impactDamageCPP %s -- ATV hits won't relay damage",
+                    g_atvImpactFn ? "did not register (the interceptor table is full)"
+                                  : "is not declared on ATV_C (a recooked Blueprint)");
+        }
     }
 }
 
