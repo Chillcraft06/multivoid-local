@@ -89,22 +89,38 @@ void EnsureOpen() {
         wchar_t path[MAX_PATH] = {};
         LogPath(path);
         wcscpy_s(g_livePath, path);
-        // Preserve the previous session's log before the open below truncates it: players hit a
-        // problem, then often relaunch before sending the log, and one level of history means the
-        // bug session survives that relaunch. The prior process has exited (each launch is a fresh
-        // process), so the rename is safe.
+        // Preserve the previous sessions' logs before the open below truncates it: players hit a
+        // problem, then often relaunch (sometimes twice) before sending the log. Five levels of
+        // history means the bug session survives multiple relaunches. The prior process has exited
+        // (each launch is a fresh process), so the renames are safe.
+        // Rotation: multivoid.log -> .prev1.log -> .prev2.log -> ... -> .prev5.log (oldest, deleted).
         {
-            wchar_t prev[MAX_PATH] = {};
-            wcscpy_s(prev, path);
-            const size_t plen = wcslen(prev);
-            if (plen > 4 && _wcsicmp(prev + plen - 4, L".log") == 0) {
-                prev[plen - 4] = L'\0';
-                wcscat_s(prev, L".prev.log");
-            } else {
-                wcscat_s(prev, L".prev");
+            wchar_t base[MAX_PATH] = {};
+            wcscpy_s(base, path);
+            const size_t blen = wcslen(base);
+            // Strip the .log extension to get the base name.
+            if (blen > 4 && _wcsicmp(base + blen - 4, L".log") == 0) {
+                base[blen - 4] = L'\0';
             }
-            wcscpy_s(g_prevPath, prev);
-            ::MoveFileExW(path, prev, MOVEFILE_REPLACE_EXISTING);  // best-effort; ignore failure
+            // Shift prev4 -> prev5, prev3 -> prev4, ..., prev1 -> prev2. Delete prev5 first.
+            for (int i = 5; i >= 1; --i) {
+                wchar_t src[MAX_PATH] = {}, dst[MAX_PATH] = {};
+                if (i == 1) {
+                    // src is the live log path; dst is base.prev1.log
+                    wcscpy_s(src, path);
+                } else {
+                    swprintf_s(src, L"%s.prev%d.log", base, i - 1);
+                }
+                swprintf_s(dst, L"%s.prev%d.log", base, i);
+                if (i == 5) {
+                    ::DeleteFileW(dst);  // drop the oldest; ignore failure
+                }
+                ::MoveFileExW(src, dst, MOVEFILE_REPLACE_EXISTING);  // best-effort; ignore failure
+                if (i == 1) {
+                    // g_prevPath points to the most recent previous log, for the bug reporter.
+                    wcscpy_s(g_prevPath, dst);
+                }
+            }
         }
         // Open with read sharing (others may read, not write), so the log can be tailed live while
         // the game runs; without it the file is locked exclusively and diagnostics cannot be read
