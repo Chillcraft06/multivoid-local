@@ -10,6 +10,7 @@
 #     powershell -ExecutionPolicy Bypass -File install-profile.ps1
 #
 #   No token or setup needed. Just run it.
+#>
 
 $ErrorActionPreference = "Stop"
 
