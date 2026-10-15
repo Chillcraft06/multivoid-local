@@ -277,8 +277,6 @@ int AttachedCharactersOf(void* actor, AttachedCharacter* out, int max) {
     return n;
 }
 
-}  // namespace ue_wrap::engine
-
 bool SetActorRootCollisionResponse(void* actor, uint8_t response) {
     void* root = PrimitiveRootOf(actor);
     if (!root) return false;
@@ -289,3 +287,5 @@ bool SetActorRootCollisionResponse(void* actor, uint8_t response) {
     f.Set<uint8_t>(L"NewResponse", response);
     return Call(root, f);
 }
+
+}  // namespace ue_wrap::engine
