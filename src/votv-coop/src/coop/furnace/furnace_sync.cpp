@@ -592,8 +592,8 @@ void SettleWatches() {
                  (r == Reg::Registered && sg::ClassNameWatchSettled(cls, name, tag)))
             ++dead;
     };
-    nameOne(L"open", kTagDoorOpen, g_regDoorOpen);
-    nameOne(L"close", kTagDoorClose, g_regDoorClose);
+    nameOne(L"Open", kTagDoorOpen, g_regDoorOpen);
+    nameOne(L"Close", kTagDoorClose, g_regDoorClose);
     clsOne(L"cremator_C", L"actionOptionIndex", kTagAction, g_regAction);
     for (int i = 0; i < kFireVerbCount; ++i)
         clsOne(L"cremator_C", kFireVerbs[i], kTagFireVerbBase + i, g_regFireVerb[i]);
@@ -632,8 +632,8 @@ void InstallWatchClass(const wchar_t* cls, const wchar_t* name, int tag, Reg& re
 
 void Install(coop::net::Session* session) {
     g_session.store(session, std::memory_order_release);
-    InstallWatchName(L"open", kTagDoorOpen, g_regDoorOpen, "a lid's open (furnace door)");
-    InstallWatchName(L"close", kTagDoorClose, g_regDoorClose, "a lid's close (furnace door)");
+    InstallWatchName(L"Open", kTagDoorOpen, g_regDoorOpen, "a lid's open (furnace door)");
+    InstallWatchName(L"Close", kTagDoorClose, g_regDoorClose, "a lid's close (furnace door)");
     InstallWatchClass(L"cremator_C", L"actionOptionIndex", kTagAction, g_regAction,
                       &OnCrematorActionPost, "the cremator's actionOptionIndex");
     for (int i = 0; i < kFireVerbCount; ++i) {
