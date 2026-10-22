@@ -7,6 +7,8 @@
 
 #include "coop/player/player_damage.h"
 
+#include "coop/config/config.h"
+#include "coop/config/config_registry.h"
 #include "coop/element/element.h"
 #include "coop/element/player.h"
 #include "coop/net/protocol.h"
@@ -20,10 +22,14 @@
 #include "ue_wrap/core/object_index.h"
 #include "ue_wrap/core/reflection.h"
 #include "ue_wrap/actors/vitals.h"
+#include "ue_wrap/core/script_gate.h"
 
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <map>
+#include <string>
+#include <tuple>
 
 namespace coop::player_damage {
 namespace {
@@ -31,6 +37,7 @@ namespace {
 namespace R = ue_wrap::reflection;
 namespace GT = ue_wrap::game_thread;
 namespace E = ue_wrap::engine;
+namespace sg = ue_wrap::script_gate;
 
 std::atomic<coop::net::Session*> g_session{nullptr};  // read in the impact interceptor (any thread)
 
@@ -99,6 +106,78 @@ bool IsPuppetSnapshot(void* actor) {
 // own contract). A published atomic keeps the CANCEL effective on every dispatching thread with one
 // acquire load and no registry access.
 std::atomic<void*> g_localPawn{nullptr};
+
+// --- Impact census (dev probe, ini damage_census=1) --------------------------------------
+// The Oct 22 playtest proved the per-class interceptors above never fire for a puppet hit:
+// neither mainPlayer_C's nor ATV_C's impactDamageCPP ran once, on either machine. Before
+// re-hooking the damage relay, learn who the game DOES call the three impact entries on.
+// A script-gate NAME watch sees every Blueprint body with the name, on any class, so one
+// session of throwing things around censuses the real dispatch shape: the object class,
+// the Actor param's class, and whether that Actor is the local pawn, a puppet, or other.
+constexpr int kTagImpactCensus = 0xDA6CE5;
+bool     g_censusArmed = false;
+bool     g_censusLiveLogged = false;
+uint64_t g_censusTotal = 0;
+// (function name, object class, Actor class, Actor kind) -> count. Kind: 0 null, 1 other,
+// 2 local pawn, 3 puppet.
+std::map<std::tuple<std::wstring, std::wstring, std::wstring, int>, uint64_t> g_censusPairs;
+
+int CensusActorKind(void* actor) {
+    if (!actor) return 0;
+    if (actor == g_localPawn.load(std::memory_order_acquire)) return 2;
+    if (IsPuppetSnapshot(actor)) return 3;
+    return 1;
+}
+
+sg::Verdict OnImpactCensusPre(const sg::Call& call) {
+    ++g_censusTotal;
+    const std::wstring fnName =
+        call.function ? R::ToString(R::NameOf(call.function)) : L"(unknown)";
+    const std::wstring objCls = call.object ? R::ClassNameOf(call.object) : L"(null)";
+    // Only impactDamageCPP's frame layout is verified (Actor at the interface offset);
+    // the other two entries census by object class alone.
+    void* actor = nullptr;
+    if (call.locals && fnName == L"impactDamageCPP") {
+        actor = *reinterpret_cast<void* const*>(call.locals + kImpactDamageCpp_ActorOffset);
+    }
+    const std::wstring actCls = actor ? R::ClassNameOf(actor) : L"(null)";
+    const int kind = CensusActorKind(actor);
+    const auto key = std::make_tuple(fnName, objCls, actCls, kind);
+    const uint64_t n = ++g_censusPairs[key];
+    if (n == 1) {
+        static const char* const kKindName[4] = {"null", "other", "LOCAL PAWN", "PUPPET"};
+        UE_LOGI("player_damage[census]: %ls on '%ls', Actor '%ls' (%s) -- first sighting",
+                fnName.c_str(), objCls.c_str(), actCls.c_str(), kKindName[kind]);
+    } else if ((g_censusTotal % 250) == 0) {
+        UE_LOGI("player_damage[census]: %llu impact calls so far, %zu distinct "
+                "(function, object, Actor, kind) tuples",
+                static_cast<unsigned long long>(g_censusTotal), g_censusPairs.size());
+    }
+    return sg::Verdict::Run;
+}
+
+void ArmCensusIfRequested() {
+    static const bool s_wanted =
+        coop::config::ResolveFlag(coop::config_registry::rows::damage_census);
+    if (!s_wanted) return;
+    if (!g_censusArmed) {
+        g_censusArmed = true;
+        for (const wchar_t* name : kImpactEntryNames) {
+            if (!sg::WatchName(name, kTagImpactCensus, &OnImpactCensusPre, nullptr)) {
+                UE_LOGW("player_damage[census]: name watch on %ls refused -- census inert "
+                        "for that entry", name);
+            }
+        }
+        UE_LOGI("player_damage[census]: armed -- watching every impact entry in the process");
+    }
+    if (!g_censusLiveLogged) {
+        sg::ResolvePendingNames();
+        if (sg::NameWatchLive(L"impactDamageCPP", kTagImpactCensus)) {
+            g_censusLiveLogged = true;
+            UE_LOGI("player_damage[census]: impactDamageCPP name watch is LIVE");
+        }
+    }
+}
 
 // PRE cancel: a physical impact dispatched on a mainPlayer BODY that is NOT the local possessed
 // player (a peer's puppet, or the F1 skin-preview mannequin) must not run the BP body -- it writes
@@ -288,6 +367,7 @@ void Tick() {
         }
         g_puppetSnapshotCount.store(n, std::memory_order_release);
     }
+    ArmCensusIfRequested();
     if (!g_impactInterceptorsDone) {
         void* cls = ue_wrap::object_index::ClassByName(L"mainPlayer_C");
         if (cls) {
@@ -318,9 +398,9 @@ void Tick() {
     // ATV interceptor: the ATV has its own impactDamageCPP. When it hits a puppet, we relay
     // heavy-tier damage+knock to the puppet's owner. Registered on its OWN latch with a
     // retry: ATV_C is world content and may not be loaded yet when mainPlayer_C first
-    // resolves. The first version rode the mainPlayer one-shot and failed SILENTLY (no
-    // retry, not even a log line) whenever ATV_C lost that race -- the Oct 22 playtest's
-    // dead ATV damage is consistent with exactly that.
+    // resolves. (Oct 22 verdict: the interceptor DID install in the playtest and still
+    // never fired -- the game does not call this entry for puppet hits at all. The relay
+    // below is dormant until the damage_census probe finds the real dispatch seam.)
     if (!g_atvInterceptorDone) {
         void* atvCls = ue_wrap::object_index::ClassByName(L"ATV_C");
         if (!atvCls) {

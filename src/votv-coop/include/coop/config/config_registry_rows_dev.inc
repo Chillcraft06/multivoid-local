@@ -152,6 +152,11 @@ CFG_FLAG(death_seam_census, "death_seam_census", "dev", false, "VOTVCOOP_DEATH_S
     "Probe: every element end the death seam announces, one [DEATH] line each -- the element's type "
     "and id, mirror or local, destroyed or streamed out, and its class -- to pair with the lanes' own "
     "death detections. Read-only.")
+CFG_FLAG(damage_census, "damage_census", "dev", false, "VOTVCOOP_DAMAGE_CENSUS",
+    "Probe: census every impactDamage / impactDamageCPP / impactSquishCPP body in the process "
+    "(object class, Actor-param class and kind: local pawn, puppet or other) to learn who the "
+    "game actually calls the impact entries on. Read-only; the Oct 22 playtest showed the "
+    "per-class interceptors on mainPlayer_C and ATV_C never fire for puppet hits.")
 CFG_FLAG(event_drill, "event_drill", "dev", false, "VOTVCOOP_EVENT_DRILL",
     "Drill (BOTH peers): the host fires the meteor shower before the client's world is up (the join "
     "snapshot carries it) and then through the scheduler itself (the clock set to day 2 00:18), then "
