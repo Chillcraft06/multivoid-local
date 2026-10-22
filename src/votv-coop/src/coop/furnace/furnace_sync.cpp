@@ -653,8 +653,14 @@ void Install(coop::net::Session* session) {
         InstallWatchClass(L"cremator_C", kFireVerbs[i], kTagFireVerbBase + i, g_regFireVerb[i],
                           &OnFireVerbPost, what);
     }
-    UE_LOGI("furnace: installed (door open/close, cremator action, %d fire-verb candidates)",
-            kFireVerbCount);
+    // subsystems::Install is a retry pump re-entered every net_pump tick; the watches
+    // above are latched, so say so once. (The Oct 22 logs carried 31k copies of this line.)
+    static bool s_announced = false;
+    if (!s_announced) {
+        s_announced = true;
+        UE_LOGI("furnace: installed (door open/close, cremator action, %d fire-verb candidates)",
+                kFireVerbCount);
+    }
 }
 
 void Tick() {
