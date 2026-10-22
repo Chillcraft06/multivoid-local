@@ -71,7 +71,27 @@ const wchar_t* const kImpactEntryNames[3] = {
 void*    g_impactFns[3] = {};
 bool     g_impactInterceptorsDone = false;
 void*    g_atvImpactFn = nullptr;
+bool     g_atvInterceptorDone = false;  // ATV registration retries independently of the
+                                        // mainPlayer latch: ATV_C (world content) can load
+                                        // after mainPlayer_C first resolves.
+bool     g_atvWaitLogged = false;
 uint32_t g_canceled = 0;   // rate-latched log counter
+
+// Puppet actor snapshot, published by Tick (game thread) for the ATV interceptor's
+// any-thread membership check -- the same pattern as g_localPawn below. kMaxPeers is 4,
+// so a plain array + atomic count is enough; Tick rewrites it every call before any latch
+// early-out, and the interceptor only reads it with an acquire load of the count.
+void*             g_puppetSnapshot[coop::players::kMaxPeers] = {};
+std::atomic<int>  g_puppetSnapshotCount{0};
+
+bool IsPuppetSnapshot(void* actor) {
+    if (!actor) return false;
+    const int n = g_puppetSnapshotCount.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (g_puppetSnapshot[i] == actor) return true;
+    }
+    return false;
+}
 
 // The LOCAL possessed player, published by Tick (game thread) for the interceptor's any-thread
 // compare. The interceptor may not reach the registry: Registry::Local() mutates game-thread-only
@@ -204,8 +224,13 @@ bool OnAtvImpactDamageCppPre(void* self, void* params) {
     const float ivx = impactVec[0], ivy = impactVec[1], ivz = impactVec[2];
 
     if (!hitActor) return false;  // ATV hit the world, not a puppet -- let it through
+    // Synchronous puppet check against the Tick-published snapshot: only cancel the ATV's
+    // native impact body when the hit actor is a puppet. Cancelling for every hit (the
+    // first version did, deciding membership later on the game thread) silently ate the
+    // ATV's own impact damage against walls, props and the ground.
+    if (!IsPuppetSnapshot(hitActor)) return false;
 
-    // Game thread: check if the hit actor is a puppet, and relay if so.
+    // Game thread: authoritative slot lookup, then relay to the puppet's owner.
     GT::Post([self, hitActor, damage, ivx, ivy, ivz] {
         if (!R::IsLive(hitActor) || !R::IsLive(self)) return;
         const int ownerSlot = SlotForPuppetActor(hitActor);
@@ -250,46 +275,70 @@ void Install(coop::net::Session* session) {
 }
 
 void Tick() {
-    // Publish the local pawn for the interceptor's any-thread compare (GT here;
-    // Registry::Local() is GT-only and cached).
-    g_localPawn.store(coop::players::Registry::Get().Local(), std::memory_order_release);
-    if (g_impactInterceptorsDone) return;
-    void* cls = ue_wrap::object_index::ClassByName(L"mainPlayer_C");
-    if (!cls) return;
-    // A Blueprint class loads with its functions, so the first attempt with the class present is the
-    // last: a name that does not resolve is a recooked Blueprint, and a full table is a capacity fault
-    // to fix, not a slot to wait for.
-    g_impactInterceptorsDone = true;
-    bool all = true;
-    for (int i = 0; i < 3; ++i) {
-        g_impactFns[i] = R::FindFunction(cls, kImpactEntryNames[i]);
-        // impactDamageCPP gets the mass-tier dispatcher (reads the hitting Actor from the params);
-        // the other entries keep the plain non-local-body cancel.
-        auto* cb = (i == 1) ? &OnImpactDamageCppPre : &OnImpactEntryPre;
-        if (g_impactFns[i] && GT::RegisterInterceptor(g_impactFns[i], cb)) continue;
-        all = false;
-        UE_LOGE("player_damage: impact entry %ls %s -- a non-local body runs its damage body", kImpactEntryNames[i],
-                g_impactFns[i] ? "did not register (the interceptor table is full)"
-                               : "is not declared on mainPlayer_C (a recooked Blueprint)");
+    // Publish the local pawn and the puppet snapshot for the interceptors' any-thread
+    // compares (GT here; Registry::Local() is GT-only and cached). This runs every Tick,
+    // before either latch's early-out.
+    auto& reg = coop::players::Registry::Get();
+    g_localPawn.store(reg.Local(), std::memory_order_release);
+    {
+        int n = 0;
+        for (uint8_t slot = 1; slot < coop::players::kMaxPeers; ++slot) {
+            coop::RemotePlayer* pup = reg.Puppet(slot);
+            if (pup && pup->GetActor()) g_puppetSnapshot[n++] = pup->GetActor();
+        }
+        g_puppetSnapshotCount.store(n, std::memory_order_release);
     }
-    if (all) {
-        UE_LOGI("player_damage: impact-entry PRE cancels installed (impactDamage=%p "
-                "impactDamageCPP=%p impactSquishCPP=%p) -- non-local bodies never run "
-                "the saveSlot damage body",
-                g_impactFns[0], g_impactFns[1], g_impactFns[2]);
+    if (!g_impactInterceptorsDone) {
+        void* cls = ue_wrap::object_index::ClassByName(L"mainPlayer_C");
+        if (cls) {
+            // A Blueprint class loads with its functions, so the first attempt with the class present is the
+            // last: a name that does not resolve is a recooked Blueprint, and a full table is a capacity fault
+            // to fix, not a slot to wait for.
+            g_impactInterceptorsDone = true;
+            bool all = true;
+            for (int i = 0; i < 3; ++i) {
+                g_impactFns[i] = R::FindFunction(cls, kImpactEntryNames[i]);
+                // impactDamageCPP gets the mass-tier dispatcher (reads the hitting Actor from the params);
+                // the other entries keep the plain non-local-body cancel.
+                auto* cb = (i == 1) ? &OnImpactDamageCppPre : &OnImpactEntryPre;
+                if (g_impactFns[i] && GT::RegisterInterceptor(g_impactFns[i], cb)) continue;
+                all = false;
+                UE_LOGE("player_damage: impact entry %ls %s -- a non-local body runs its damage body", kImpactEntryNames[i],
+                        g_impactFns[i] ? "did not register (the interceptor table is full)"
+                                       : "is not declared on mainPlayer_C (a recooked Blueprint)");
+            }
+            if (all) {
+                UE_LOGI("player_damage: impact-entry PRE cancels installed (impactDamage=%p "
+                        "impactDamageCPP=%p impactSquishCPP=%p) -- non-local bodies never run "
+                        "the saveSlot damage body",
+                        g_impactFns[0], g_impactFns[1], g_impactFns[2]);
+            }
+        }
     }
-    // ATV interceptor: the ATV has its own impactDamageCPP. When it hits a puppet,
-    // we relay heavy-tier damage+knock to the puppet's owner.
-    void* atvCls = ue_wrap::object_index::ClassByName(L"ATV_C");
-    if (atvCls) {
-        g_atvImpactFn = R::FindFunction(atvCls, L"impactDamageCPP");
-        if (g_atvImpactFn && GT::RegisterInterceptor(g_atvImpactFn, &OnAtvImpactDamageCppPre)) {
-            UE_LOGI("player_damage: ATV impactDamageCPP interceptor installed (%p) -- ATV hits relay to puppet owners",
-                    g_atvImpactFn);
+    // ATV interceptor: the ATV has its own impactDamageCPP. When it hits a puppet, we relay
+    // heavy-tier damage+knock to the puppet's owner. Registered on its OWN latch with a
+    // retry: ATV_C is world content and may not be loaded yet when mainPlayer_C first
+    // resolves. The first version rode the mainPlayer one-shot and failed SILENTLY (no
+    // retry, not even a log line) whenever ATV_C lost that race -- the Oct 22 playtest's
+    // dead ATV damage is consistent with exactly that.
+    if (!g_atvInterceptorDone) {
+        void* atvCls = ue_wrap::object_index::ClassByName(L"ATV_C");
+        if (!atvCls) {
+            if (!g_atvWaitLogged) {
+                g_atvWaitLogged = true;
+                UE_LOGI("player_damage: ATV_C not loaded yet -- ATV impact interceptor will retry");
+            }
         } else {
-            UE_LOGE("player_damage: ATV impactDamageCPP %s -- ATV hits won't relay damage",
-                    g_atvImpactFn ? "did not register (the interceptor table is full)"
-                                  : "is not declared on ATV_C (a recooked Blueprint)");
+            g_atvInterceptorDone = true;
+            g_atvImpactFn = R::FindFunction(atvCls, L"impactDamageCPP");
+            if (g_atvImpactFn && GT::RegisterInterceptor(g_atvImpactFn, &OnAtvImpactDamageCppPre)) {
+                UE_LOGI("player_damage: ATV impactDamageCPP interceptor installed (%p) -- ATV hits relay to puppet owners",
+                        g_atvImpactFn);
+            } else {
+                UE_LOGE("player_damage: ATV impactDamageCPP %s -- ATV hits won't relay damage",
+                        g_atvImpactFn ? "did not register (the interceptor table is full)"
+                                      : "is not declared on ATV_C (a recooked Blueprint)");
+            }
         }
     }
 }
