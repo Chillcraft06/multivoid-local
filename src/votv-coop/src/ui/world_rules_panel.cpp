@@ -5,6 +5,7 @@
 #include "ue_wrap/world/game_rules.h"
 #include "ue_wrap/world/game_rules_pane.h"
 #include "ue_wrap/core/game_thread.h"
+#include "ue_wrap/core/log.h"  // the Oct 22 witness lines (UE_LOGI) need it explicitly
 #include "ue_wrap/engine/world_identity.h"
 #include "ui/scale.h"
 
