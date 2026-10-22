@@ -243,6 +243,26 @@ void Render() {
     g_lastFrame = frame;
     s_worldGen = worldGen;
 
+    // Click witness: the Oct 22 panel rendered, hovered, and ignored EVERY click, even the
+    // ungated row-name Selectable -- so no mouse press reached any widget. One line on the
+    // first click ImGui sees while this pane renders separates the layers: absent entirely,
+    // the press never entered io (WndProc/capture); present with hovered=0, a window above
+    // this one owns the point; present and hovered, the pane's own hit rects are wrong.
+    {
+        static bool s_clickLogged = false;
+        if (edge) s_clickLogged = false;
+        const ImGuiIO& io = ImGui::GetIO();
+        if (!s_clickLogged && io.MouseClicked[0]) {
+            s_clickLogged = true;
+            const ImVec2 wp = ImGui::GetWindowPos();
+            const ImVec2 ws = ImGui::GetWindowSize();
+            UE_LOGI("world_rules_panel: click seen -- mouse=(%.0f,%.0f) window=(%.0f,%.0f)+"
+                    "(%.0fx%.0f) windowHovered=%d anyItemHovered=%d",
+                    io.MousePos.x, io.MousePos.y, wp.x, wp.y, ws.x, ws.y,
+                    ImGui::IsWindowHovered() ? 1 : 0, ImGui::IsAnyItemHovered() ? 1 : 0);
+        }
+    }
+
     if (ImGui::SmallButton("Refresh")) RequestSnapshot();
     ImGui::SameLine();
     // Host-only editing: the host (or a solo player, who the game's own menu lets edit) gets
