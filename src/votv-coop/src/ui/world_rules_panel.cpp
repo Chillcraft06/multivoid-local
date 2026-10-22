@@ -209,6 +209,14 @@ namespace {
 // against the live rules (kind match, enum ordinal in the game's name list, float finite and
 // clamped) and writes the process + saved copies; the host's accepted edits broadcast.
 void SubmitEdit(const std::string& key, GR::Kind kind, bool bval, int ival, float fval) {
+    // First-call witness: the Oct 22 host session showed the editable header, dead controls
+    // and ZERO worldrules lines, so whether a click ever arrives here is itself unknown.
+    static bool s_firstCall = true;
+    if (s_firstCall) {
+        s_firstCall = false;
+        UE_LOGI("world_rules_panel: first SubmitEdit reached ('%s') -- the panel's controls "
+                "DO deliver edits", key.c_str());
+    }
     if (!coop::worldrules_sync::RequestRuleEdit(key, kind, bval, ival, fval)) return;
     GT::Post([] { coop::worldrules_sync::DrainEditQueue(); });
 }
@@ -274,6 +282,18 @@ void Render() {
         s_nextRetry = ImGui::GetTime() + 1.0;
         --s_retriesLeft;
         RequestSnapshot();
+    }
+    // Open-edge witness (Oct 22: host saw the editable header, every control inert, and the
+    // log carried not one edit line). One line per open separates the three suspects:
+    // canEdit false (values render as text), every row greyed (controls suppressed), or
+    // input never reaching the widgets (this line healthy, SubmitEdit's witness absent).
+    if (edge) {
+        int rows = 0, greyed = 0;
+        for (const ViewCategory& cat : s_view.categories)
+            for (const ViewRow& row : cat.rows) { ++rows; if (row.greyed) ++greyed; }
+        UE_LOGI("world_rules_panel: opened -- canEdit=%d viewValid=%d settled=%d rows=%d "
+                "greyed=%d", canEdit ? 1 : 0, s_view.valid ? 1 : 0, s_view.settled ? 1 : 0,
+                rows, greyed);
     }
     if (!s_view.valid) {
         ImGui::Spacing();
