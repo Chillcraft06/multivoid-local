@@ -15,6 +15,7 @@
 #include "coop/net/session.h"
 #include "coop/net/wire_key_util.h"  // WireKeyFromString / StringFromWireKey
 #include "coop/player/players_registry.h"  // kMaxPeers, Registry::Get().LocalPlayerElementId()
+#include "coop/player/remote_player.h"     // RemotePlayer::GetActor (occupant detection)
 #include "coop/session/net_pump.h"  // IsInAnnouncedWorld
 
 #include "ue_wrap/actors/prop.h"  // GetActorSaveKeyString (the Aactor_save_C::Key reader)
@@ -281,21 +282,60 @@ int DetectOccupant(void* cremator) {
                std::fabs(p.Y - cl.Y) <= kInsideXYCm &&
                std::fabs(p.Z - cl.Z) <= kInsideZCm;
     };
+    // Nearest-inside wins, not first match. The Oct 22 test: the host stood at the
+    // controls, inside this box, while the client was physically in the chamber, and
+    // the old local-first order credited the host (occupantSlot=0 on the wire; the
+    // client in the chamber never burned). Distance to the cremator's center is the
+    // discriminator the order was not. Remote slots read the puppet ACTOR's location
+    // (what physically stands in the world here), falling back to the pose snapshot.
+    // NOTE: whether the box itself is centered on the chamber is still unmeasured --
+    // the geometry log below exists to settle that with numbers, not another guess.
+    int best = -1;
+    float bestD2 = 0.f;
+    auto consider = [&](int slot, const ue_wrap::FVector& p) {
+        if (!inside(p)) return;
+        const float dx = p.X - cl.X, dy = p.Y - cl.Y;
+        const float d2 = dx * dx + dy * dy;
+        if (best < 0 || d2 < bestD2) { best = slot; bestD2 = d2; }
+    };
     void* pawn = LocalPawn();
-    if (pawn) {
-        ue_wrap::FVector pl{};
-        if (E::TryGetActorLocation(pawn, pl) && inside(pl)) return 0;
-    }
+    ue_wrap::FVector pl{};
+    const bool haveLocal = pawn && E::TryGetActorLocation(pawn, pl);
+    if (haveLocal) consider(0, pl);
+    auto& reg = coop::players::Registry::Get();
     auto* s = g_session.load(std::memory_order_acquire);
-    if (s) {
-        for (int slot = 1; slot < coop::players::kMaxPeers; ++slot) {
+    ue_wrap::FVector pp[coop::players::kMaxPeers]{};
+    bool haveP[coop::players::kMaxPeers]{};
+    for (int slot = 1; slot < coop::players::kMaxPeers; ++slot) {
+        coop::RemotePlayer* pup = reg.Puppet(static_cast<uint8_t>(slot));
+        void* actor = pup ? pup->GetActor() : nullptr;
+        if (actor && E::TryGetActorLocation(actor, pp[slot])) {
+            haveP[slot] = true;
+        } else if (s) {
             net::PoseSnapshot pose{};
-            if (!s->TryGetRemotePose(slot, pose)) continue;
-            const ue_wrap::FVector pp{pose.x, pose.y, pose.z};
-            if (inside(pp)) return slot;
+            if (s->TryGetRemotePose(slot, pose)) {
+                pp[slot] = ue_wrap::FVector{pose.x, pose.y, pose.z};
+                haveP[slot] = true;
+            }
+        }
+        if (haveP[slot]) consider(slot, pp[slot]);
+    }
+    static int s_lastLogged = -3;
+    if (best != s_lastLogged) {
+        s_lastLogged = best;
+        UE_LOGI("furnace: occupant verdict slot %d -- cremator at (%.0f,%.0f,%.0f), "
+                "local pawn %s (%.0f,%.0f,%.0f)%s",
+                best, cl.X, cl.Y, cl.Z, haveLocal ? "at" : "UNREADABLE",
+                pl.X, pl.Y, pl.Z, best == 0 ? " <-- NEAREST INSIDE" : "");
+        for (int slot = 1; slot < coop::players::kMaxPeers; ++slot) {
+            if (!haveP[slot]) continue;
+            UE_LOGI("furnace:   slot %d pawn at (%.0f,%.0f,%.0f) dXY=(%.0f,%.0f)%s",
+                    slot, pp[slot].X, pp[slot].Y, pp[slot].Z,
+                    std::fabs(pp[slot].X - cl.X), std::fabs(pp[slot].Y - cl.Y),
+                    best == slot ? " <-- NEAREST INSIDE" : "");
         }
     }
-    return -1;
+    return best;
 }
 
 bool IsLocalPawnInside(void* cremator) {
@@ -540,8 +580,21 @@ void ApplyFireState(const std::wstring& key, bool fireOn, int occupantSlot) {
         // burn from the playtest. Clear it.
         ClearLocalBurnFields("fire-state-stuck");
     } else {
-        UE_LOGI("furnace: OnFireState -- local burn untouched (inside=%d burning=%d t=%.1f)",
-                inside ? 1 : 0, burning ? 1 : 0, t);
+        // Geometry on the refusal path: the Oct 22 client's inside read false all
+        // session while its player stood in the chamber, with no numbers to indict
+        // the box or the pivot. Print both locations so the next log settles it.
+        ue_wrap::FVector cl2{}, pl2{};
+        const bool haveC = E::TryGetActorLocation(cremator, cl2);
+        void* pawn2 = LocalPawn();
+        const bool haveP = pawn2 && E::TryGetActorLocation(pawn2, pl2);
+        UE_LOGI("furnace: OnFireState -- local burn untouched (inside=%d burning=%d t=%.1f) "
+                "cremator %s (%.0f,%.0f,%.0f) pawn %s (%.0f,%.0f,%.0f) d=(%.0f,%.0f,%.0f) "
+                "box=(%.0f,%.0f,%.0f)",
+                inside ? 1 : 0, burning ? 1 : 0, t,
+                haveC ? "at" : "UNREADABLE", cl2.X, cl2.Y, cl2.Z,
+                haveP ? "at" : "UNREADABLE", pl2.X, pl2.Y, pl2.Z,
+                std::fabs(pl2.X - cl2.X), std::fabs(pl2.Y - cl2.Y), std::fabs(pl2.Z - cl2.Z),
+                kInsideXYCm, kInsideXYCm, kInsideZCm);
     }
 }
 
