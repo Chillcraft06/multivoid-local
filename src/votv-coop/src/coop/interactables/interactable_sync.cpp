@@ -7,6 +7,7 @@
 
 #include "coop/interactables/interactable_sync.h"
 #include "coop/interactables/interactable_channel.h"  // the generic engine: Adapter and Channel
+#include "coop/furnace/furnace_sync.h"  // IsFurnaceDoor: the container lane must not claim it
 
 #include "ue_wrap/devices/appliance.h"     // the six-class save-actor toggle family
 #include "ue_wrap/devices/door.h"
@@ -112,10 +113,18 @@ const Adapter g_lightGroupAdapter = {
     },
     nullptr,  // no TickApply: runTrigger lands the state in its own body
 };
+// The furnace door is a prop_swinger_C too, but furnace_sync owns it: host-authoritative,
+// keyed by the cremator, with its own verb watch. Claiming it here as a symmetric container
+// as well gave one physical lid two owners with independent baselines, and each owner's
+// apply was the other owner's fresh edge -- a cross-machine loop that toggled the door
+// 7,000+ times in the Oct 22 playtest and flooded the reliable lane. One device, one owner.
+bool IsContainerSwinger(void* obj) {
+    return ue_wrap::swinger::IsSwinger(obj) && !coop::furnace_sync::IsFurnaceDoor(obj);
+}
 const Adapter g_containerAdapter = {
     "container", coop::net::ReliableKind::ContainerState,
     &ue_wrap::swinger::EnsureResolved,
-    &ue_wrap::swinger::IsSwinger,
+    &IsContainerSwinger,
     &ue_wrap::prop::GetKeyString,  // a swinger is an Aprop_C
     &ue_wrap::swinger::TryReadOpen,
     [](void* a, bool on) -> bool { return on ? ue_wrap::swinger::CallOpen(a, false) : ue_wrap::swinger::CallClose(a); },

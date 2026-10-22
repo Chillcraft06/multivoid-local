@@ -63,6 +63,12 @@ namespace coop::furnace_sync {
 // fire-verb candidates). Idempotent; safe to call once per session. Game thread.
 void Install(coop::net::Session* session);
 
+// True iff `actor` is the furnace's door: a prop_swinger_C whose parent actor is a
+// cremator. Other sync lanes use this to leave the door to this module -- one device,
+// one owner (the generic container channel claiming it too looped the door in the
+// Oct 22 playtest). Game thread.
+bool IsFurnaceDoor(void* actor);
+
 // Per-tick: settle the watches, run fire discovery, poll the fire state on the host,
 // re-check the occupant while the fire is on, and run the stuck-burn watchdog.
 // Game thread.

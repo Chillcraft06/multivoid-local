@@ -630,6 +630,17 @@ void InstallWatchClass(const wchar_t* cls, const wchar_t* name, int tag, Reg& re
 
 // --- Public API -------------------------------------------------------------------------------
 
+bool IsFurnaceDoor(void* actor) {
+    if (!actor) return false;
+    // Resolve just the class here (not the full EnsureResolved discovery): this runs on
+    // other lanes' index paths, possibly before this module's first Tick.
+    if (!g_crematorCls) g_crematorCls = OI::ClassByName(L"cremator_C");
+    if (!g_crematorCls) return false;
+    if (!SW::IsSwinger(actor)) return false;
+    void* parent = E::ParentActorOf(actor, nullptr);
+    return parent && IsCremator(parent);
+}
+
 void Install(coop::net::Session* session) {
     g_session.store(session, std::memory_order_release);
     InstallWatchName(L"Open", kTagDoorOpen, g_regDoorOpen, "a lid's open (furnace door)");
